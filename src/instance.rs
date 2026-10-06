@@ -66,10 +66,20 @@ fn running() -> Option<(HWND, u32)> {
 }
 
 pub fn close_existing() -> Result<(), String> {
-    let Some((hwnd, pid)) = running() else {
-        return Instance::acquire()?
-            .map(|_| ())
-            .ok_or_else(|| "Portside is starting. Try again after it has started.".into());
+    // The installer can retain the lock briefly after its launcher exits.
+    // A starting Portside also owns it before creating its window.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (hwnd, pid) = loop {
+        if let Some(owner) = running() {
+            break owner;
+        }
+        if Instance::acquire()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("Portside's single-instance lock is still in use.".into());
+        }
+        thread::sleep(Duration::from_millis(50));
     };
     unsafe {
         let process = OpenProcess(
