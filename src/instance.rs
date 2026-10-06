@@ -123,7 +123,7 @@ pub fn start() -> Result<(), String> {
 /// object. Portside must outlive whatever launched the installer, so leave
 /// that job when the host permits it. When breakaway is forbidden, a plain
 /// spawn is fine unless the host's job kills its children on close: then
-/// Portside would die with the shell, so refuse before startup is registered.
+/// Portside would die with the shell, so refuse to launch it there.
 fn spawn_detached(target: &Path) -> Result<Child, String> {
     match Command::new(target)
         .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
@@ -179,7 +179,7 @@ fn verify_started(child: &mut Child) -> Result<(), String> {
             window_since = None;
         }
         if Instant::now() >= deadline {
-            return Err("The installed Portside did not create its window. Startup registration was not changed.".into());
+            return Err("The installed Portside did not create its window.".into());
         }
         thread::sleep(Duration::from_millis(50));
     }

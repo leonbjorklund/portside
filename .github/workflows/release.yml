@@ -14,11 +14,6 @@ jobs:
         run: |
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo.toml' }
-      - name: Set up Rust
-        shell: pwsh
-        run: |
-          rustup toolchain install 1.96.1 --profile minimal --component clippy
-          rustup default 1.96.1
       - name: Check
         shell: pwsh
         run: |

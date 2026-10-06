@@ -36,6 +36,7 @@ Source: "..\target\release\portside.exe"; Flags: dontcopy
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion touch
 Source: "..\assets\fonts\atkinsonhyperlegible\OFL.txt"; DestDir: "{app}"; DestName: "AtkinsonHyperlegible-OFL.txt"; Flags: ignoreversion touch
 Source: "licenses\*.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion touch
+Source: "..\target\package-tools\Rust-COPYRIGHT-library.html"; DestDir: "{app}\licenses"; Flags: ignoreversion touch
 
 [Icons]
 Name: "{userprograms}\Portside"; Filename: "{app}\portside.exe"; WorkingDir: "{app}"
