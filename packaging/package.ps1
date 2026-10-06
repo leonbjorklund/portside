@@ -11,6 +11,9 @@ try {
     }
     cargo build --release --locked
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+    if ((Get-Item target\release\portside.exe).VersionInfo.ProductVersion -ne $version) {
+        throw 'Executable version must match Cargo.toml'
+    }
 
     $toolsDirectory = Join-Path (Get-Location) 'target\package-tools'
     New-Item -ItemType Directory -Path $toolsDirectory -Force | Out-Null
