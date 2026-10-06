@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-mod install;
+mod instance;
 mod render;
 mod servers;
 mod theme;
@@ -16,11 +16,12 @@ fn wide(text: &str) -> Vec<u16> {
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
-        [arg] if arg == "--install" => return install::install(),
+        [arg] if arg == "--quit" => return instance::close_existing(),
+        [arg] if arg == "--start" => return instance::start(),
         [] => {}
-        _ => return Err("Use --install, or run without arguments.".into()),
+        _ => return Err("Run without arguments.".into()),
     }
-    match install::Instance::acquire()? {
+    match instance::Instance::acquire()? {
         Some(_instance) => ui::run(),
         None => Ok(()),
     }
@@ -28,6 +29,10 @@ fn run() -> Result<(), String> {
 
 fn main() {
     if let Err(error) = run() {
+        if std::env::args().any(|arg| arg == "--quit" || arg == "--start") {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         unsafe {
             MessageBoxW(
                 null_mut(),

@@ -2,14 +2,13 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/directwrite.cpp");
-    println!("cargo:rerun-if-changed=src/shortcut.cpp");
     cc::Build::new()
         .cpp(true)
         .flag("/utf-8")
         .flag("/EHsc")
-        .files(["src/directwrite.cpp", "src/shortcut.cpp"])
+        .file("src/directwrite.cpp")
         .compile("portside_native");
-    for lib in ["d2d1", "dwrite", "ole32", "shell32", "uuid"] {
+    for lib in ["d2d1", "dwrite", "ole32"] {
         println!("cargo:rustc-link-lib={lib}");
     }
 
