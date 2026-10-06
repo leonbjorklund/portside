@@ -1,0 +1,10 @@
+# Portside
+
+Windows taskbar strip listing local dev servers: cycle through them, see how many there are, click one to open it in the default browser, middle-click one to stop it. It sits right of agent-usage-overlay and matches its look.
+
+- Status: working. Same stack as agent-usage-overlay: Rust 2024, `windows-sys`, `win-taskbar-host` (pinned to a release tag in `Cargo.toml`) for hosting, Direct2D/DirectWrite in `src/directwrite.cpp` built with `cc`.
+- Code: `servers.rs` reads the TCP listener table every second, looks up a process's name and working directory once per new PID and port, and stops a server (Ctrl+C in its console, then `taskkill`). `ui.rs` hosts the strip, draws it and the server menu, and handles input. `render.rs` wraps `directwrite.cpp`. `install.rs` installs.
+- Design: `src/theme.rs` holds every size, color, font and icon, in DIPs. `design/spec.md` describes states and behavior by those names. Change them together.
+- Font: Atkinson Hyperlegible Regular only, embedded from `assets/fonts/`, with its OFL beside it. Icons are Segoe Fluent Icons glyphs from Windows, never files. The one exception is the exe's icon, `assets/portside.ico`, which `build.rs` embeds through `src/portside.rc`, along with the version info that names the exe Portside, published by Leon Björklund.
+- Install: `cargo build --release`, then run `target\release\portside.exe --install` from a regular terminal. It copies the exe to `%LOCALAPPDATA%\Portside`, adds the `Portside` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, adds a Start menu shortcut and restarts the running copy. Codex shells and Claude Desktop's Bash tool redirect `%LOCALAPPDATA%` and HKCU, so the installer refuses there; Claude Desktop's PowerShell tool is not redirected. Right-click > Exit stops it; Move places it, and the host saves the position.
+- Checks: `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo build --release`. Then run the release exe and compare each state in `design/spec.md` on the real taskbar.

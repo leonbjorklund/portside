@@ -1,0 +1,27 @@
+#pragma code_page(65001)
+
+// Windows shows the first icon resource as the executable's icon.
+1 ICON "assets/portside.ico"
+
+// Task Manager and Settings > Apps > Startup show the description as the
+// app's name and the company as its publisher. build.rs defines the versions.
+1 VERSIONINFO
+FILEVERSION VERSION
+PRODUCTVERSION VERSION
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Leon Björklund"
+            VALUE "FileDescription", "Portside"
+            VALUE "FileVersion", VERSION_TEXT
+            VALUE "ProductName", "Portside"
+            VALUE "ProductVersion", VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
