@@ -54,3 +54,7 @@ Right-click anywhere opens win-taskbar-host's menu: Portside's Exit item, then t
 The icon is the strip's globe (`GLOBE` in `TEXT`) with a thin `TASKBAR` outline and no tile, stored in `assets/portside.ico` at 16, 20, 24, 32, 40, 48, 64 and 256 px. The outline keeps the white globe visible on light backgrounds. At 24 px and below the outline can't fit between the globe's lines, so the globe's disk is filled `TASKBAR` instead. Windows shows it for the exe in File Explorer, the Start menu shortcut and Search, Task Manager and Settings > Apps > Startup.
 
 Those places name the app Portside, published by Leon Björklund, instead of portside.exe. Both come from the exe's version info, whose version is `Cargo.toml`'s.
+
+## Updates
+
+An installed Portside checks GitHub for a newer stable release in the background and upgrades itself silently. Nothing shows while it does: no prompt, notification or setting. The strip leaves for a few seconds while Portside restarts, then returns in the same place. A copy that was not installed by the installer, such as a build from source, never updates.

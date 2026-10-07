@@ -44,10 +44,15 @@ Name: "{userprograms}\Portside"; Filename: "{app}\portside.exe"; WorkingDir: "{a
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Portside"; ValueData: """{app}\portside.exe"""; Flags: uninsdeletevalue
 
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\updates"
+
 [Code]
 var
   Reservation: THandle;
   StartFailed: Boolean;
+  Stopping: Boolean;
+  StartAttempted: Boolean;
 
 function CreateMutex(Attributes: LongWord; InitialOwner: Boolean; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -67,6 +72,31 @@ begin
   end;
 end;
 
+function SetupRunning: Boolean;
+var
+  Mutex: THandle;
+begin
+  Mutex := CreateMutex(0, False, 'PortsideSetup');
+  Result := (Mutex <> 0) and (DLLGetLastError = 183);
+  if Mutex <> 0 then
+    CloseHandle(Mutex);
+end;
+
+// An update that is installing finishes before Portside is removed, so it
+// cannot put Portside back afterwards.
+procedure WaitForSetup;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  while SetupRunning and (Waited < 60000) do begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+  if SetupRunning then
+    RaiseException(FmtMessage(SetupMessage(msgUninstallAppRunningError), ['Portside']));
+end;
+
 procedure ReleaseReservation;
 begin
   if Reservation <> 0 then begin
@@ -79,6 +109,7 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ReleaseReservation;
   ExtractTemporaryFile('portside.exe');
+  Stopping := True;
   if not StopPortside(ExpandConstant('{tmp}\portside.exe')) then
     Result := FmtMessage(SetupMessage(msgSetupAppRunningError), ['Portside']);
 end;
@@ -91,6 +122,7 @@ begin
   if CurStep = ssPostInstall then begin
     ReleaseReservation;
     Executable := ExpandConstant('{app}\portside.exe');
+    StartAttempted := True;
     StartFailed := not Exec(Executable, '--start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
     if not StartFailed then
       StartFailed := ExitCode <> 0;
@@ -107,15 +139,23 @@ begin
 end;
 
 procedure DeinitializeSetup;
+var
+  ExitCode: Integer;
 begin
   ReleaseReservation;
+  // An upgrade that fails or is cancelled after stopping Portside leaves
+  // the previous copy in place, so start it again.
+  if Stopping and not StartAttempted then
+    Exec(ExpandConstant('{app}\portside.exe'), '--start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usUninstall then
+  if CurUninstallStep = usUninstall then begin
+    WaitForSetup;
     if not StopPortside(ExpandConstant('{app}\portside.exe')) then
       RaiseException(FmtMessage(SetupMessage(msgUninstallAppRunningError), ['Portside']));
+  end;
 end;
 
 procedure DeinitializeUninstall;

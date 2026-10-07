@@ -743,6 +743,7 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 });
             }
             WM_CLOSE => {
+                crate::update::closing();
                 EndMenu();
                 PostQuitMessage(0);
             }

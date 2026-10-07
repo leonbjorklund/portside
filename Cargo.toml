@@ -1,6 +1,6 @@
 [package]
 name = "portside"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2024"
 publish = false
 
@@ -12,8 +12,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinHttp",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_JobObjects",
@@ -25,6 +27,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[features]
+# Points the updater at a local server and shortens its schedule, for tests only.
+test-update-server = []
 
 [build-dependencies]
 cc = "1"

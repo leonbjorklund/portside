@@ -1,10 +1,13 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod fetch;
 mod instance;
+mod json;
 mod render;
 mod servers;
 mod theme;
 mod ui;
+mod update;
 
 use std::ptr::null_mut;
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
@@ -22,7 +25,10 @@ fn run() -> Result<(), String> {
         _ => return Err("Run without arguments.".into()),
     }
     match instance::Instance::acquire()? {
-        Some(_instance) => ui::run(),
+        Some(_instance) => {
+            update::start();
+            ui::run()
+        }
         None => Ok(()),
     }
 }
