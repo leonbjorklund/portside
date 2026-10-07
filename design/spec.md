@@ -57,4 +57,4 @@ Those places name the app Portside, published by Leon Björklund, instead of por
 
 ## Updates
 
-An installed Portside checks GitHub for a newer stable release in the background and upgrades itself silently. Nothing shows while it does: no prompt, notification or setting. The strip leaves for a few seconds while Portside restarts, then returns in the same place. A copy that was not installed by the installer, such as a build from source, never updates.
+An installed Portside checks GitHub for a newer stable release in the background and upgrades itself. Nothing shows while it does: no prompt, notification or setting. The strip leaves for a few seconds while Portside restarts, then returns in the same place. A copy that was not installed by the installer, such as a build from source, never updates.

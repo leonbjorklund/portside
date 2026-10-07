@@ -52,7 +52,6 @@ var
   Reservation: THandle;
   StartFailed: Boolean;
   Stopping: Boolean;
-  StartAttempted: Boolean;
 
 function CreateMutex(Attributes: LongWord; InitialOwner: Boolean; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -72,31 +71,6 @@ begin
   end;
 end;
 
-function SetupRunning: Boolean;
-var
-  Mutex: THandle;
-begin
-  Mutex := CreateMutex(0, False, 'PortsideSetup');
-  Result := (Mutex <> 0) and (DLLGetLastError = 183);
-  if Mutex <> 0 then
-    CloseHandle(Mutex);
-end;
-
-// An update that is installing finishes before Portside is removed, so it
-// cannot put Portside back afterwards.
-procedure WaitForSetup;
-var
-  Waited: Integer;
-begin
-  Waited := 0;
-  while SetupRunning and (Waited < 60000) do begin
-    Sleep(250);
-    Waited := Waited + 250;
-  end;
-  if SetupRunning then
-    RaiseException(FmtMessage(SetupMessage(msgUninstallAppRunningError), ['Portside']));
-end;
-
 procedure ReleaseReservation;
 begin
   if Reservation <> 0 then begin
@@ -111,7 +85,14 @@ begin
   ExtractTemporaryFile('portside.exe');
   Stopping := True;
   if not StopPortside(ExpandConstant('{tmp}\portside.exe')) then
-    Result := FmtMessage(SetupMessage(msgSetupAppRunningError), ['Portside']);
+    Result := FmtMessage(SetupMessage(msgSetupAppRunningError), ['Portside'])
+  // Portside runs updates from {app}\updates. Such an update stops here if
+  // Portside was uninstalled, instead of putting it back. The uninstaller
+  // needs the reservation this Setup now holds, so it cannot run in between.
+  // {src} has links resolved, so only its last two folders are compared.
+  else if PathEndsWith(ExpandConstant('{src}'), '\Portside\updates', True) and
+    not FileExists(ExpandConstant('{app}\unins000.exe')) then
+    Result := SetupMessage(msgSetupAborted);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -122,7 +103,7 @@ begin
   if CurStep = ssPostInstall then begin
     ReleaseReservation;
     Executable := ExpandConstant('{app}\portside.exe');
-    StartAttempted := True;
+    Stopping := False;
     StartFailed := not Exec(Executable, '--start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
     if not StartFailed then
       StartFailed := ExitCode <> 0;
@@ -143,16 +124,24 @@ var
   ExitCode: Integer;
 begin
   ReleaseReservation;
-  // An upgrade that fails or is cancelled after stopping Portside leaves
-  // the previous copy in place, so start it again.
-  if Stopping and not StartAttempted then
+  // Setup that stopped Portside and did not finish starts it again. When
+  // Portside was uninstalled, portside.exe is gone and Exec does nothing.
+  if Stopping then
     Exec(ExpandConstant('{app}\portside.exe'), '--start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Waited: Integer;
 begin
   if CurUninstallStep = usUninstall then begin
-    WaitForSetup;
+    // An update that is already installing finishes first, so the uninstall
+    // does not run into its files.
+    Waited := 0;
+    while CheckForMutexes('PortsideSetup') and (Waited < 60000) do begin
+      Sleep(250);
+      Waited := Waited + 250;
+    end;
     if not StopPortside(ExpandConstant('{app}\portside.exe')) then
       RaiseException(FmtMessage(SetupMessage(msgUninstallAppRunningError), ['Portside']));
   end;
