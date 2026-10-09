@@ -52,6 +52,7 @@ var
   Reservation: THandle;
   StartFailed: Boolean;
   Stopping: Boolean;
+  Uninstalling: THandle;
 
 function CreateMutex(Attributes: LongWord; InitialOwner: Boolean; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -87,11 +88,14 @@ begin
   if not StopPortside(ExpandConstant('{tmp}\portside.exe')) then
     Result := FmtMessage(SetupMessage(msgSetupAppRunningError), ['Portside'])
   // Portside runs updates from {app}\updates. Such an update stops here if
-  // Portside was uninstalled, instead of putting it back. The uninstaller
-  // needs the reservation this Setup now holds, so it cannot run in between.
-  // {src} has links resolved, so only its last two folders are compared.
+  // Portside was uninstalled, instead of putting it back, or is being
+  // uninstalled, instead of leaving a second uninstaller behind. The
+  // uninstaller needs the reservation this Setup now holds, so it cannot run
+  // in between. {src} has links resolved, so only its last two folders are
+  // compared.
   else if PathEndsWith(ExpandConstant('{src}'), '\Portside\updates', True) and
-    not FileExists(ExpandConstant('{app}\unins000.exe')) then
+    (CheckForMutexes('PortsideUninstall') or
+     not FileExists(ExpandConstant('{app}\unins000.exe'))) then
     Result := SetupMessage(msgSetupAborted);
 end;
 
@@ -130,6 +134,14 @@ begin
     Exec(ExpandConstant('{app}\portside.exe'), '--start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
 end;
 
+function InitializeUninstall: Boolean;
+begin
+  // An update that has not started installing sees this and stops. It cannot
+  // use unins000.dat, which this uninstaller already has open.
+  Uninstalling := CreateMutex(0, False, 'PortsideUninstall');
+  Result := True;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Waited: Integer;
@@ -150,4 +162,6 @@ end;
 procedure DeinitializeUninstall;
 begin
   ReleaseReservation;
+  if Uninstalling <> 0 then
+    CloseHandle(Uninstalling);
 end;
