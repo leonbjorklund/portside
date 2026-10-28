@@ -222,7 +222,7 @@ struct Process(HANDLE);
 impl Process {
     fn open(pid: u32, access: u32) -> Option<Self> {
         let handle = unsafe { OpenProcess(access, 0, pid) };
-        (!handle.is_null()).then_some(Self(handle))
+        (!handle.is_null()).then(|| Self(handle))
     }
 
     fn image(&self) -> Option<String> {
