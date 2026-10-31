@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::windows::process::CommandExt,
     process::{Command, Stdio},
     ptr::null_mut,
@@ -50,9 +50,21 @@ static CONSOLE: Mutex<()> = Mutex::new(());
 pub struct Server {
     pub port: u16,
     pub name: String,
-    /// Listening on IPv6, which decides its URL when another server holds
-    /// the same port on IPv4.
-    pub ipv6: bool,
+    pub address: IpAddr,
+}
+
+impl Server {
+    pub fn url(&self, shared: bool) -> String {
+        if !shared && (self.address.is_ipv6() || self.address.is_unspecified()) {
+            return format!("http://localhost:{}", self.port);
+        }
+        let address = match self.address {
+            IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(address) if address.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            address => address,
+        };
+        format!("http://{}", SocketAddr::new(address, self.port))
+    }
 }
 
 /// Remembers each (pid, port) pair's lookup, so a poll only opens new processes.
@@ -68,7 +80,7 @@ impl Scanner {
             .retain(|&(pid, port), _| listeners.iter().any(|l| (l.0, l.1) == (pid, port)));
         let mut servers: Vec<Server> = listeners
             .into_iter()
-            .filter_map(|(pid, port, ipv6)| {
+            .filter_map(|(pid, port, address)| {
                 let name = self
                     .known
                     .entry((pid, port))
@@ -76,7 +88,7 @@ impl Scanner {
                 Some(Server {
                     port,
                     name: name.clone()?,
-                    ipv6,
+                    address,
                 })
             })
             .collect();
@@ -147,20 +159,28 @@ fn ctrl_c(pid: u32) -> bool {
     }
 }
 
-/// Every (pid, port, IPv6) listening on a loopback or wildcard address. A
+/// Every (pid, port, address) listening on a loopback or wildcard address. A
 /// process listening on both families counts once, as IPv4.
-fn listeners() -> Vec<(u32, u16, bool)> {
+fn listeners() -> Vec<(u32, u16, IpAddr)> {
     let mut found = Vec::new();
     for row in rows::<MIB_TCPROW_OWNER_PID>(&table(AF_INET)) {
         let address = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
         if address.is_loopback() || address.is_unspecified() {
-            found.push((row.dwOwningPid, u16::from_be(row.dwLocalPort as u16), false));
+            found.push((
+                row.dwOwningPid,
+                u16::from_be(row.dwLocalPort as u16),
+                address.into(),
+            ));
         }
     }
     for row in rows::<MIB_TCP6ROW_OWNER_PID>(&table(AF_INET6)) {
         let address = Ipv6Addr::from(row.ucLocalAddr);
         if address.is_loopback() || address.is_unspecified() {
-            found.push((row.dwOwningPid, u16::from_be(row.dwLocalPort as u16), true));
+            found.push((
+                row.dwOwningPid,
+                u16::from_be(row.dwLocalPort as u16),
+                address.into(),
+            ));
         }
     }
     found.sort_unstable();
@@ -289,13 +309,48 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn opens_listeners_at_the_expected_host() {
+        for (listen, single, shared) in [
+            ("127.0.0.1:0", "127.0.0.1", "127.0.0.1"),
+            ("127.0.0.2:0", "127.0.0.2", "127.0.0.2"),
+            ("[::1]:0", "localhost", "[::1]"),
+            ("0.0.0.0:0", "localhost", "127.0.0.1"),
+            ("[::]:0", "localhost", "[::1]"),
+        ] {
+            let listener = TcpListener::bind(listen).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (_, _, address) = super::listeners()
+                .into_iter()
+                .find(|&(pid, found, _)| pid == std::process::id() && found == port)
+                .unwrap();
+            let server = super::Server {
+                port,
+                name: "test".into(),
+                address,
+            };
+            assert_eq!(
+                server.url(false),
+                format!("http://{single}:{port}"),
+                "{listen}"
+            );
+            assert_eq!(
+                server.url(true),
+                format!("http://{shared}:{port}"),
+                "{listen}"
+            );
+        }
+    }
+
+    #[test]
     fn finds_loopback_and_wildcard_listeners() {
         let pid = std::process::id();
-        for address in ["127.0.0.1:0", "0.0.0.0:0", "[::1]:0"] {
+        for address in ["127.0.0.1:0", "0.0.0.0:0", "[::1]:0", "[::]:0"] {
             let listener = TcpListener::bind(address).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let ipv6 = address.starts_with('[');
-            assert!(super::listeners().contains(&(pid, port, ipv6)), "{address}");
+            let socket = listener.local_addr().unwrap();
+            assert!(
+                super::listeners().contains(&(pid, socket.port(), socket.ip())),
+                "{address}"
+            );
         }
     }
 }

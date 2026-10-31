@@ -341,8 +341,14 @@ impl State {
         if servers == self.servers {
             return;
         }
-        let index =
-            |target: Option<&Server>| target.and_then(|t| servers.iter().position(|s| s == t));
+        // Keep the selection if a server changes its address within the same family.
+        let index = |target: Option<&Server>| {
+            target.and_then(|t| {
+                servers.iter().position(|s| {
+                    (s.port, &s.name, s.address.is_ipv6()) == (t.port, &t.name, t.address.is_ipv6())
+                })
+            })
+        };
         let kept = index(self.chosen.as_ref()).or_else(|| index(self.servers.get(self.current)));
         self.current = kept.unwrap_or(self.current.min(servers.len().saturating_sub(1)));
         self.servers = servers;
@@ -474,25 +480,18 @@ impl State {
             Part::Row(row) => self.choose(row),
         }
         if let Some(server) = self.servers.get(self.current) {
-            // localhost reaches only one of two servers sharing a port, so
-            // those open at the loopback address of their own family.
+            // localhost may reach another server when they share a port.
             let shared = self
                 .servers
                 .iter()
                 .filter(|s| s.port == server.port)
                 .count()
                 > 1;
-            let host = match (shared, server.ipv6) {
-                (false, _) => "localhost",
-                (true, false) => "127.0.0.1",
-                (true, true) => "[::1]",
-            };
             // A short-lived Explorer opens the default browser, so the shell's
             // URL handlers never load into this long-running process. It gets
             // no standard handles, which a stop briefly swaps for a console's.
-            let url = format!("http://{host}:{}", server.port);
             let _ = Command::new("explorer")
-                .arg(url)
+                .arg(server.url(shared))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

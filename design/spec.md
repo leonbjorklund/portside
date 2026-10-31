@@ -24,7 +24,7 @@ The count, name and port are all `STRIP_SIZE`, agent-usage-overlay's text size, 
 
 - **Hover the label:** a rounded `HOVER_ALPHA` background that hugs the globe, count, name and port. The empty space to its right does nothing.
 - **Scroll anywhere on the strip:** scrolling down moves to the next server, scrolling up to the previous. It wraps around.
-- **Click the label:** open `http://localhost:<port>` in the default browser. When two servers share a port, one on IPv4 and one on IPv6, `localhost` reaches only one of them, so each opens at its own address instead: `127.0.0.1` or `[::1]`.
+- **Click the label:** open the server over HTTP in the default browser. An IPv4 loopback listener opens at its address; an IPv6 listener or a server listening on every address opens at `localhost`. If another server shares its port, an IPv6 or wildcard listener opens at its family's loopback address (`[::1]` or `127.0.0.1`) instead.
 - **Middle-click the label:** stop the server it shows, as if you pressed Ctrl+C in its terminal, so every process in that terminal gets the Ctrl+C. A server without a terminal, or one still running two seconds later, is ended along with every process it started. Nothing shows while it stops; it leaves the strip within a second of exiting. If it can't be stopped (an elevated server), nothing happens.
 - **Pressed:** the hover rect drops to `PRESSED_ALPHA` while the left or middle button is down.
 
