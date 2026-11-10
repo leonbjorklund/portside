@@ -8,7 +8,10 @@ pub mod font {
     pub const FAMILY: &str = "Atkinson Hyperlegible";
     pub const REGULAR: &[u8] =
         include_bytes!("../assets/fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Regular.ttf");
-    /// The only weight used anywhere (DWRITE_FONT_WEIGHT_NORMAL).
+    /// Rows of projects that are not defaults.
+    pub const ITALIC: &[u8] =
+        include_bytes!("../assets/fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Italic.ttf");
+    /// The one weight, used by both faces (DWRITE_FONT_WEIGHT_NORMAL).
     pub const WEIGHT: u32 = 400;
 
     /// The count, name and port, at agent-usage-overlay's text size.
@@ -22,7 +25,11 @@ pub mod font {
     pub const ICON_FAMILY: &str = "Segoe Fluent Icons";
     /// The globe fills its one-em box, which is centered in the strip.
     pub const ICON_SIZE: f32 = 12.0;
+    /// The toggle view's outlined plus and minus.
+    pub const ACTION_SIZE: f32 = 13.0;
     pub const GLOBE: &str = "\u{E774}"; // Globe
+    pub const ADD: &str = "\u{ECC8}"; // AddTo
+    pub const REMOVE: &str = "\u{ECC9}"; // RemoveFrom
 }
 
 pub mod color {
@@ -39,8 +46,10 @@ pub mod color {
     pub const PRESSED_ALPHA: f32 = 0.05;
 
     pub const MENU: Rgb = 0x2b2b2b;
+    /// The menu's border and the line between its groups.
     pub const MENU_BORDER: Rgb = 0x3a3a3a;
-    pub const MENU_ROW: Rgb = 0xb4b4b4;
+    /// The name and port of a project that isn't running.
+    pub const STOPPED: Rgb = 0x949494;
 
     /// The globe while no servers are running.
     pub const GLOBE_EMPTY: Rgb = 0x6b6b6b;
@@ -67,11 +76,13 @@ pub mod strip {
     pub const NAME_TO_PORT: f32 = 5.0;
 }
 
-/// Server list shown while the label is hovered. Its bottom edge touches the
-/// top of the label's hover rect, so the pointer can move into it directly.
+/// The panel above the strip: the server menu shown while the label is
+/// hovered, or the toggle view opened from the right-click menu. Its bottom
+/// edge touches the top of the label's hover rect, so the pointer can move
+/// into it directly.
 pub mod menu {
     pub const SHOW_DELAY_MS: u32 = 350;
-    pub const MIN_W: f32 = 170.0;
+    pub const MIN_W: f32 = 215.0;
     pub const PAD: f32 = 3.0;
     pub const BORDER: f32 = 1.0;
     /// DWMWCP_ROUND, which also gives the system shadow.
@@ -82,4 +93,24 @@ pub mod menu {
     pub const ROW_GAP: f32 = 1.0;
     pub const ROW_RADIUS: f32 = 4.0;
     pub const NAME_TO_PORT_MIN: f32 = 16.0;
+
+    /// The line between groups, and each bar of the drag handle.
+    pub const LINE_H: f32 = 1.0;
+    /// Above and below the line.
+    pub const LINE_MARGIN: f32 = 2.0;
+    pub const HANDLE_W: f32 = 9.0;
+    pub const HANDLE_H: f32 = 7.0;
+    /// The vertical center of each bar, from the top of the handle.
+    pub const HANDLE_BARS: [f32; 2] = [2.0, 5.0];
+    /// Handle to name, port to plus or minus, and spinner to port.
+    pub const ICON_TO_TEXT: f32 = 5.0;
+    /// With `ICON_TO_TEXT` this is `NAME_TO_PORT_MIN`, so nothing moves when
+    /// a spinner appears.
+    pub const SPINNER: f32 = 11.0;
+    pub const SPINNER_RADIUS: f32 = 4.1;
+    pub const SPINNER_STROKE: f32 = 1.15;
+    /// Degrees of the circle drawn. The rest is the gap.
+    pub const SPINNER_SWEEP: f32 = 270.0;
+    pub const SPINNER_TURN_MS: u32 = 1000;
+    pub const SPINNER_FRAME_MS: u32 = 33;
 }

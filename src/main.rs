@@ -3,6 +3,7 @@
 mod fetch;
 mod instance;
 mod json;
+mod projects;
 mod render;
 mod servers;
 mod theme;

@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-win-taskbar-host = { git = "https://github.com/leonbjorklund/win-taskbar-host", tag = "v0.2.0" }
+win-taskbar-host = { git = "https://github.com/leonbjorklund/win-taskbar-host", tag = "v0.3.0" }
 windows-sys = { version = "0.61.2", features = [
     "Wdk_System_Threading",
     "Win32_Foundation",

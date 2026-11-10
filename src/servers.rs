@@ -1,15 +1,20 @@
 //! Dev servers: TCP ports listening on localhost (or on every address) whose
 //! process is a dev runtime, named by that process's working directory.
-//! Stopping one sends Ctrl+C to its console, then forces it.
+//! Stopping one sends Ctrl+C to its console, then forces it. A saved command
+//! starts one again with no window.
 
 use std::{
     collections::HashMap,
+    env,
+    ffi::OsString,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::windows::process::CommandExt,
-    process::{Command, Stdio},
+    path::Path,
+    process::{Child, Command, Stdio},
     ptr::null_mut,
     sync::Mutex,
     thread,
+    time::{Duration, Instant},
 };
 use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
@@ -40,10 +45,31 @@ use windows_sys::{
 const RUNTIMES: [&str; 4] = ["node", "bun", "deno", "python"];
 /// How long a server gets to exit after Ctrl+C before it is forced.
 const STOP_WAIT_MS: u32 = 2000;
+/// How long a start gets to listen before its processes are ended.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How far up the parents a server's command is looked for. A reused process
+/// ID can form a cycle.
+const MAX_ANCESTORS: usize = 8;
 
 /// Held while Portside is attached to a server's console, since a process can
 /// be attached to only one console at a time.
 static CONSOLE: Mutex<()> = Mutex::new(());
+
+/// A command that starts a server, run from its working directory.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Launch {
+    pub dir: String,
+    pub exe: String,
+    pub args: String,
+    /// The command belongs to a listening server that starts this one.
+    pub nested: bool,
+}
+
+impl Launch {
+    pub fn name(&self) -> &str {
+        file_name(self.dir.trim_end_matches('\\'))
+    }
+}
 
 /// Ordered by port, then name.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,9 +77,28 @@ pub struct Server {
     pub port: u16,
     pub name: String,
     pub address: IpAddr,
+    /// None when the process's memory can't be read (an elevated one).
+    pub launch: Option<Launch>,
 }
 
 impl Server {
+    pub fn in_folder(&self, dir: &str) -> bool {
+        self.launch
+            .as_ref()
+            .is_some_and(|launch| launch.dir.eq_ignore_ascii_case(dir))
+    }
+
+    /// Whether this is the server saved as `launch` on `port`: the same port,
+    /// or the same command on another, since Vite moves ports. `nested` is part
+    /// of the command, so Tina's own :4001 never counts as Astro's :4321.
+    pub fn runs(&self, launch: &Launch, port: u16) -> bool {
+        let same_command = |own: &Launch| {
+            (&own.exe, &own.args, own.nested) == (&launch.exe, &launch.args, launch.nested)
+        };
+        self.in_folder(&launch.dir)
+            && (self.port == port || self.launch.as_ref().is_some_and(same_command))
+    }
+
     pub fn url(&self, shared: bool) -> String {
         if !shared && (self.address.is_ipv6() || self.address.is_unspecified()) {
             return format!("http://localhost:{}", self.port);
@@ -70,7 +115,7 @@ impl Server {
 /// Remembers each (pid, port) pair's lookup, so a poll only opens new processes.
 #[derive(Default)]
 pub struct Scanner {
-    known: HashMap<(u32, u16), Option<String>>,
+    known: HashMap<(u32, u16), Option<Server>>,
 }
 
 impl Scanner {
@@ -79,16 +124,20 @@ impl Scanner {
         self.known
             .retain(|&(pid, port), _| listeners.iter().any(|l| (l.0, l.1) == (pid, port)));
         let mut servers: Vec<Server> = listeners
-            .into_iter()
-            .filter_map(|(pid, port, address)| {
-                let name = self
-                    .known
-                    .entry((pid, port))
-                    .or_insert_with(|| project(pid));
+            .iter()
+            .filter_map(|&(pid, port, address)| {
+                let known = self.known.entry((pid, port)).or_insert_with(|| {
+                    let (name, launch) = project(pid, &listeners)?;
+                    Some(Server {
+                        port,
+                        name,
+                        address,
+                        launch,
+                    })
+                });
                 Some(Server {
-                    port,
-                    name: name.clone()?,
                     address,
+                    ..known.clone()?
                 })
             })
             .collect();
@@ -101,12 +150,68 @@ impl Scanner {
     /// Stops a server from the last scan, each of its processes on its own
     /// thread: one project can listen on IPv4 and IPv6 from two.
     pub fn stop(&self, server: &Server) {
-        for (&(pid, port), name) in &self.known {
-            if port == server.port && name.as_ref() == Some(&server.name) {
+        for (&(pid, port), known) in &self.known {
+            if port == server.port && known.as_ref().is_some_and(|k| k.name == server.name) {
                 thread::spawn(move || stop_process(pid, port));
             }
         }
     }
+}
+
+/// A saved command that has not listened yet.
+pub struct Starting {
+    pub launch: Launch,
+    pub port: u16,
+    child: Child,
+    since: Instant,
+}
+
+impl Starting {
+    pub fn expired(&self) -> bool {
+        self.since.elapsed() >= START_TIMEOUT
+    }
+
+    /// Holding `child` through taskkill keeps its ID from being reused.
+    pub fn end(self) {
+        thread::spawn(move || taskkill(self.child.id()));
+    }
+}
+
+/// Runs a saved command with no window. Its hidden console still takes Ctrl+C.
+pub fn start(launch: &Launch, port: u16) -> Option<Starting> {
+    let mut command = Command::new(&launch.exe);
+    command
+        .raw_arg(&launch.args)
+        .current_dir(&launch.dir)
+        .env("PATH", search_path(launch))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // A child inherits Portside's ignoring of Ctrl+C. The lock keeps that
+    // from lapsing while Portside is attached to a server's console.
+    let _attached = CONSOLE.lock();
+    unsafe { SetConsoleCtrlHandler(None, 0) };
+    let child = command.spawn();
+    unsafe { SetConsoleCtrlHandler(None, 1) };
+    Some(Starting {
+        launch: launch.clone(),
+        port,
+        child: child.ok()?,
+        since: Instant::now(),
+    })
+}
+
+/// PATH with every `node_modules\.bin` from the project folder upward and the
+/// exe's folder in front, so tools run by name resolve as under `npm run`.
+fn search_path(launch: &Launch) -> OsString {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let folders = Path::new(&launch.dir)
+        .ancestors()
+        .map(|folder| folder.join(r"node_modules\.bin"))
+        .chain(Path::new(&launch.exe).parent().map(Path::to_path_buf))
+        .chain(env::split_paths(&path));
+    env::join_paths(folders).unwrap_or(path)
 }
 
 /// Ctrl+C first, as if typed in the server's terminal. A server without a
@@ -124,16 +229,20 @@ fn stop_process(pid: u32, port: u16) {
     let exited =
         ctrl_c(pid) && unsafe { WaitForSingleObject(process.0, STOP_WAIT_MS) } == WAIT_OBJECT_0;
     if !exited {
-        // No standard handles, which another stop may have swapped for its
-        // server's console.
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        taskkill(pid);
     }
+}
+
+/// Ends `pid` and every process it started. No standard handles, which another
+/// stop may have swapped for its server's console.
+fn taskkill(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Sends Ctrl+C to every process in `pid`'s console, Portside included while
@@ -221,20 +330,74 @@ fn rows<T>(table: &[u32]) -> &[T] {
     }
 }
 
-/// The project folder of a dev runtime, or None for any other process. A
-/// server whose memory can't be read (an elevated one) shows its runtime name.
-fn project(pid: u32) -> Option<String> {
+/// The project folder of a dev runtime and its command, or None for any other
+/// process. A server whose memory can't be read (an elevated one) shows its
+/// runtime name.
+fn project(pid: u32, listeners: &[(u32, u16, IpAddr)]) -> Option<(String, Option<Launch>)> {
     let image = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.image()?;
-    let exe = image.rsplit('\\').next()?.to_ascii_lowercase();
+    let exe = file_name(&image).to_ascii_lowercase();
     if !RUNTIMES.iter().any(|runtime| exe.starts_with(runtime)) {
         return None;
     }
-    let directory = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
-        .and_then(|process| process.directory());
-    Some(match directory {
-        Some(path) => path.trim_end_matches('\\').rsplit('\\').next()?.to_owned(),
-        None => exe.trim_end_matches(".exe").to_owned(),
-    })
+    let launch = launch(pid, listeners);
+    let name = launch
+        .as_ref()
+        .map_or(exe.trim_end_matches(".exe"), Launch::name)
+        .to_owned();
+    // A saved command is stored on one line.
+    Some((
+        name,
+        launch.filter(|launch| !launch.args.contains(['\r', '\n'])),
+    ))
+}
+
+/// The command that starts the server `pid`. A parent with the same exe name
+/// and working directory is a wrapper around it, such as a venv's python.exe,
+/// so the topmost one's command is taken. So is that of an ancestor that is
+/// listening itself, as Tina starts Astro through cmd.exe, and the server is
+/// then marked `nested`.
+fn launch(pid: u32, listeners: &[(u32, u16, IpAddr)]) -> Option<Launch> {
+    let read = |pid| {
+        let process = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
+        Some((process.image()?, process.parameters()?))
+    };
+    let (exe, (dir, line, mut parent)) = read(pid)?;
+    let mut launch = Launch {
+        dir,
+        exe,
+        args: arguments(&line).to_owned(),
+        nested: false,
+    };
+    let mut unbroken = true;
+    for _ in 0..MAX_ANCESTORS {
+        let Some((exe, (dir, line, next))) = read(parent) else {
+            break;
+        };
+        let same = file_name(&exe).eq_ignore_ascii_case(file_name(&launch.exe))
+            && dir.eq_ignore_ascii_case(&launch.dir);
+        let listening = listeners.iter().any(|l| l.0 == parent);
+        unbroken &= same;
+        if same && (unbroken || listening) {
+            launch.exe = exe;
+            launch.args = arguments(&line).to_owned();
+            launch.nested |= listening;
+        }
+        parent = next;
+    }
+    Some(launch)
+}
+
+/// A command line without argv[0].
+fn arguments(line: &str) -> &str {
+    let rest = match line.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"').map_or("", |(_, rest)| rest),
+        None => line.find([' ', '\t']).map_or("", |at| &line[at..]),
+    };
+    rest.trim_start_matches([' ', '\t'])
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('\\').next().unwrap_or(path)
 }
 
 struct Process(HANDLE);
@@ -252,9 +415,10 @@ impl Process {
         (ok != 0).then(|| String::from_utf16_lossy(&path[..length as usize]))
     }
 
-    /// The current directory from the process's PEB: PEB+0x20 points to its
-    /// parameters, whose CurrentDirectory UNICODE_STRING sits at +0x38.
-    fn directory(&self) -> Option<String> {
+    /// The current directory, command line and parent process ID. PEB+0x20
+    /// points to the parameters, whose CurrentDirectory and CommandLine
+    /// UNICODE_STRINGs sit at +0x38 and +0x70.
+    fn parameters(&self) -> Option<(String, String, u32)> {
         let mut basic = [0usize; 6];
         let status = unsafe {
             NtQueryInformationProcess(
@@ -269,18 +433,27 @@ impl Process {
             return None;
         }
         let [parameters] = self.read::<1>(basic[1] + 0x20)?;
-        let [lengths, buffer] = self.read::<2>(parameters + 0x38)?;
-        let mut path = vec![0u16; (lengths & 0xffff) / 2];
+        Some((
+            self.string(parameters + 0x38)?,
+            self.string(parameters + 0x70)?,
+            basic[5] as u32,
+        ))
+    }
+
+    /// The UNICODE_STRING at `address`.
+    fn string(&self, address: usize) -> Option<String> {
+        let [lengths, buffer] = self.read::<2>(address)?;
+        let mut text = vec![0u16; (lengths & 0xffff) / 2];
         let ok = unsafe {
             ReadProcessMemory(
                 self.0,
                 buffer as *const _,
-                path.as_mut_ptr().cast(),
-                path.len() * 2,
+                text.as_mut_ptr().cast(),
+                text.len() * 2,
                 null_mut(),
             )
         };
-        (ok != 0).then(|| String::from_utf16_lossy(&path))
+        (ok != 0).then(|| String::from_utf16_lossy(&text))
     }
 
     fn read<const N: usize>(&self, address: usize) -> Option<[usize; N]> {
@@ -327,6 +500,7 @@ mod tests {
                 port,
                 name: "test".into(),
                 address,
+                launch: None,
             };
             assert_eq!(
                 server.url(false),
@@ -338,6 +512,19 @@ mod tests {
                 format!("http://{shared}:{port}"),
                 "{listen}"
             );
+        }
+    }
+
+    #[test]
+    fn strips_the_program_from_a_command_line() {
+        for (line, args) in [
+            (r#""C:\node.exe"  vite.js --port 1"#, "vite.js --port 1"),
+            ("node vite.js", "vite.js"),
+            ("node\tvite.js", "vite.js"),
+            ("node", ""),
+            (r#""C:\node.exe vite.js"#, ""),
+        ] {
+            assert_eq!(super::arguments(line), args, "{line}");
         }
     }
 

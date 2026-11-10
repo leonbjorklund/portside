@@ -8,8 +8,10 @@ use windows_sys::Win32::Graphics::Gdi::HDC;
 
 unsafe extern "C" {
     fn portside_renderer_create(
-        font: *const u8,
-        length: u32,
+        regular: *const u8,
+        regular_length: u32,
+        italic: *const u8,
+        italic_length: u32,
         family: *const u16,
         icon_family: *const u16,
         weight: u32,
@@ -20,9 +22,7 @@ unsafe extern "C" {
         renderer: *mut c_void,
         text: *const u16,
         length: u32,
-        icon: i32,
-        size: f32,
-        feature: u32,
+        style: *const Style,
     ) -> f32;
     fn portside_begin(
         renderer: *mut c_void,
@@ -37,11 +37,19 @@ unsafe extern "C" {
         renderer: *mut c_void,
         text: *const u16,
         length: u32,
-        icon: i32,
-        size: f32,
-        feature: u32,
+        style: *const Style,
         rect: *const Rect,
         align: i32,
+        color: Rgb,
+    );
+    fn portside_arc(
+        renderer: *mut c_void,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        start: f32,
+        sweep: f32,
+        stroke: f32,
         color: Rgb,
     );
     /// Whether the device was lost and the scene must be drawn again.
@@ -51,15 +59,25 @@ unsafe extern "C" {
 /// Left, top, right, bottom, laid out as `D2D1_RECT_F`.
 pub type Rect = [f32; 4];
 
-/// Size, whether it is the icon font, and an OpenType feature tag or 0.
+#[repr(i32)]
 #[derive(Clone, Copy)]
-pub struct Style(pub f32, pub bool, pub u32);
+pub enum Face {
+    Regular,
+    Italic,
+    Icon,
+}
+
+/// Size, face, and an OpenType feature tag or 0.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Style(pub f32, pub Face, pub u32);
 
 /// DWRITE_TEXT_ALIGNMENT.
 #[derive(Clone, Copy)]
 pub enum Align {
     Leading = 0,
     Trailing = 1,
+    Center = 2,
 }
 
 pub struct Renderer(NonNull<c_void>);
@@ -71,6 +89,8 @@ impl Renderer {
             portside_renderer_create(
                 font::REGULAR.as_ptr(),
                 font::REGULAR.len() as u32,
+                font::ITALIC.as_ptr(),
+                font::ITALIC.len() as u32,
                 wide(font::FAMILY).as_ptr(),
                 wide(font::ICON_FAMILY).as_ptr(),
                 font::WEIGHT,
@@ -84,16 +104,7 @@ impl Renderer {
 
     pub fn measure(&self, text: &str, style: Style) -> f32 {
         let text: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            portside_measure(
-                self.0.as_ptr(),
-                text.as_ptr(),
-                text.len() as u32,
-                style.1.into(),
-                style.0,
-                style.2,
-            )
-        }
+        unsafe { portside_measure(self.0.as_ptr(), text.as_ptr(), text.len() as u32, &style) }
     }
 
     /// Clears to `background` and draws `scene`, once more after a lost device.
@@ -125,11 +136,34 @@ impl Renderer {
                 self.0.as_ptr(),
                 text.as_ptr(),
                 text.len() as u32,
-                style.1.into(),
-                style.0,
-                style.2,
+                &style,
                 &rect,
                 align as i32,
+                color,
+            )
+        }
+    }
+
+    /// Only inside `paint`. An open arc with round ends. Angles are degrees
+    /// clockwise from 12 o'clock.
+    pub fn arc(
+        &self,
+        center: (f32, f32),
+        radius: f32,
+        start: f32,
+        sweep: f32,
+        stroke: f32,
+        color: Rgb,
+    ) {
+        unsafe {
+            portside_arc(
+                self.0.as_ptr(),
+                center.0,
+                center.1,
+                radius,
+                start,
+                sweep,
+                stroke,
                 color,
             )
         }
