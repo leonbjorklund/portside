@@ -228,11 +228,13 @@ extern "C" void portside_arc(void* handle, float cx, float cy, float radius, flo
             renderer->round_caps.Get());
 }
 
-// D2DERR_RECREATE_TARGET drops the target and returns true; the caller repaints.
-extern "C" bool portside_end(void* handle) noexcept {
+// A lost device drops the target so the caller can retry the frame.
+extern "C" HRESULT portside_end(void* handle) noexcept {
     auto* renderer = static_cast<Renderer*>(handle);
-    if (renderer->target->EndDraw() != D2DERR_RECREATE_TARGET) return false;
-    renderer->brush.Reset();
-    renderer->target.Reset();
-    return true;
+    const HRESULT result = renderer->target->EndDraw();
+    if (result == D2DERR_RECREATE_TARGET) {
+        renderer->brush.Reset();
+        renderer->target.Reset();
+    }
+    return result;
 }

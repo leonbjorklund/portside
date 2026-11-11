@@ -1,10 +1,21 @@
-//! The drawing primitives in directwrite.cpp. Lengths are DIPs.
+//! Direct2D drawing and window presentation. Drawing lengths are DIPs.
 use crate::{
     theme::{Rgb, font},
     wide,
 };
-use std::{ffi::c_void, ptr::NonNull};
-use windows_sys::Win32::Graphics::Gdi::HDC;
+use std::{
+    ffi::c_void,
+    mem::zeroed,
+    ptr::{NonNull, null, null_mut},
+};
+use windows_sys::Win32::{
+    Foundation::{D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE},
+    Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, HDC, SelectObject,
+    },
+    UI::WindowsAndMessaging::{ULW_OPAQUE, UpdateLayeredWindow},
+};
 
 unsafe extern "C" {
     fn portside_renderer_create(
@@ -52,8 +63,7 @@ unsafe extern "C" {
         stroke: f32,
         color: Rgb,
     );
-    /// Whether the device was lost and the scene must be drawn again.
-    fn portside_end(renderer: *mut c_void) -> bool;
+    fn portside_end(renderer: *mut c_void) -> i32;
 }
 
 /// Left, top, right, bottom, laid out as `D2D1_RECT_F`.
@@ -108,18 +118,98 @@ impl Renderer {
     }
 
     /// Clears to `background` and draws `scene`, once more after a lost device.
-    pub fn paint(&self, dc: HDC, size: (i32, i32), dpi: u32, background: Rgb, scene: impl Fn()) {
+    pub fn paint(
+        &self,
+        dc: HDC,
+        size: (i32, i32),
+        dpi: u32,
+        background: Rgb,
+        scene: impl Fn(),
+    ) -> bool {
         for _ in 0..2 {
             let begun = unsafe {
                 portside_begin(self.0.as_ptr(), dc, size.0, size.1, dpi as f32, background)
             };
             if begun < 0 {
-                return;
+                return false;
             }
             scene();
-            if !unsafe { portside_end(self.0.as_ptr()) } {
-                return;
+            let result = unsafe { portside_end(self.0.as_ptr()) };
+            if result != D2DERR_RECREATE_TARGET {
+                return result >= 0;
             }
+        }
+        false
+    }
+
+    /// Draws an opaque layered window and publishes its pixels and screen rect together.
+    pub fn present(
+        &self,
+        hwnd: HWND,
+        rect: RECT,
+        dpi: u32,
+        background: Rgb,
+        scene: impl Fn(),
+    ) -> bool {
+        let size = (rect.right - rect.left, rect.bottom - rect.top);
+        if size.0 <= 0 || size.1 <= 0 {
+            return false;
+        }
+        unsafe {
+            let dc = CreateCompatibleDC(null_mut());
+            if dc.is_null() {
+                return false;
+            }
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: size.0,
+                    biHeight: -size.1,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..zeroed()
+                },
+                ..zeroed()
+            };
+            let mut bits = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bitmap.is_null() {
+                DeleteDC(dc);
+                return false;
+            }
+            let previous = SelectObject(dc, bitmap);
+            if previous.is_null() {
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                return false;
+            }
+            let drawn = self.paint(dc, size, dpi, background, scene);
+            let position = POINT {
+                x: rect.left,
+                y: rect.top,
+            };
+            let size = SIZE {
+                cx: size.0,
+                cy: size.1,
+            };
+            let origin = POINT { x: 0, y: 0 };
+            let updated = drawn
+                && UpdateLayeredWindow(
+                    hwnd,
+                    null_mut(),
+                    &position,
+                    &size,
+                    dc,
+                    &origin,
+                    0,
+                    null(),
+                    ULW_OPAQUE,
+                ) != 0;
+            SelectObject(dc, previous);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            updated
         }
     }
 

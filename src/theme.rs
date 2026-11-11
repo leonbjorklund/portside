@@ -25,11 +25,12 @@ pub mod font {
     pub const ICON_FAMILY: &str = "Segoe Fluent Icons";
     /// The globe fills its one-em box, which is centered in the strip.
     pub const ICON_SIZE: f32 = 12.0;
-    /// The toggle view's outlined plus and minus.
+    /// The toggle view's action icons.
     pub const ACTION_SIZE: f32 = 13.0;
     pub const GLOBE: &str = "\u{E774}"; // Globe
     pub const ADD: &str = "\u{ECC8}"; // AddTo
     pub const REMOVE: &str = "\u{ECC9}"; // RemoveFrom
+    pub const CLEAR: &str = "\u{E894}"; // Clear
 }
 
 pub mod color {
@@ -102,7 +103,7 @@ pub mod menu {
     pub const HANDLE_H: f32 = 7.0;
     /// The vertical center of each bar, from the top of the handle.
     pub const HANDLE_BARS: [f32; 2] = [2.0, 5.0];
-    /// Handle to name, port to plus or minus, and spinner to port.
+    /// Left icon to name, port to action, and spinner to port.
     pub const ICON_TO_TEXT: f32 = 5.0;
     /// With `ICON_TO_TEXT` this is `NAME_TO_PORT_MIN`, so nothing moves when
     /// a spinner appears.

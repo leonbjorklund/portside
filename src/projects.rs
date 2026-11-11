@@ -134,6 +134,15 @@ impl Projects {
         self.observe(servers);
     }
 
+    /// Forgets a stopped past run until its folder is seen running again.
+    pub fn remove_past(&mut self, i: usize) {
+        let project = &self.list[i];
+        if !project.default && project.server.is_none() {
+            self.list.remove(i);
+            self.save();
+        }
+    }
+
     /// Moves a default during a drag. The caller saves when the drag ends.
     pub fn reorder(&mut self, from: usize, to: usize) {
         let project = self.list.remove(from);
@@ -322,6 +331,36 @@ mod tests {
         }));
         projects.observe(&[server(11, project(11))]);
         assert_eq!(ports(&projects), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11]);
+    }
+
+    #[test]
+    fn only_stopped_past_runs_can_be_forgotten_until_seen_again() {
+        let removed = launch(r"C:\removed\", "");
+        let mut projects = projects([
+            (true, 1, launch(r"C:\stopped-default\", "")),
+            (true, 2, launch(r"C:\running-default\", "")),
+            (false, 3, launch(r"C:\running\", "")),
+            (false, 4, removed.clone()),
+            (false, 5, launch(r"C:\other-past\", "")),
+        ]);
+        let mut running = vec![
+            server(2, launch(r"C:\running-default\", "")),
+            server(3, launch(r"C:\running\", "")),
+        ];
+        projects.observe(&running);
+        for i in 0..3 {
+            projects.remove_past(i);
+        }
+        assert_eq!(ports(&projects), [1, 2, 3, 4, 5]);
+
+        projects.remove_past(3);
+        assert_eq!(ports(&projects), [1, 2, 3, 5]);
+        projects.observe(&running);
+        assert_eq!(ports(&projects), [1, 2, 3, 5]);
+
+        running.push(server(4, removed));
+        projects.observe(&running);
+        assert_eq!(ports(&projects), [1, 2, 4, 3, 5]);
     }
 
     #[test]

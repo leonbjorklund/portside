@@ -22,7 +22,9 @@ use windows_sys::Win32::{
         Dwm::{
             DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
         },
-        Gdi::{BeginPaint, EndPaint, HDC, InvalidateRect, PAINTSTRUCT, ScreenToClient},
+        Gdi::{
+            BeginPaint, EndPaint, HDC, InvalidateRect, PAINTSTRUCT, ScreenToClient, ValidateRect,
+        },
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -81,6 +83,7 @@ enum Mode {
 enum Zone {
     Body,
     Action,
+    Clear,
     Handle,
 }
 
@@ -170,7 +173,7 @@ pub fn run() -> Result<(), String> {
         + strip::LABEL_PAD_X;
     register(CLASS_NAME, Some(menu_proc));
     register(VIEW_CLASS, Some(view_proc));
-    let ex_style = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+    let ex_style = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED;
     let menu = window(CLASS_NAME, ex_style, WS_POPUP, null_mut(), (0, 0))?;
     unsafe {
         // DWM rounds the corners and adds the shadow. Its border matches the
@@ -403,6 +406,7 @@ impl State {
     /// Polls the listener table and finishes the starts that now listen.
     fn refresh(&mut self) {
         let servers = self.scanner.scan();
+        let starting = self.starting.len();
         let mut started = Vec::new();
         for start in take(&mut self.starting) {
             match servers.iter().find(|s| s.runs(&start.launch, start.port)) {
@@ -416,6 +420,8 @@ impl State {
         }
         if servers != self.servers {
             self.apply(servers);
+        } else if self.starting.len() != starting {
+            self.rehover();
         }
         for server in &started {
             self.open(server);
@@ -512,10 +518,15 @@ impl State {
                         Zone::Action
                     }
                     Row::Item { project, .. }
-                        if self.is_default(project)
-                            && at.0 < rect[0] + menu::ROW_PAD_X + menu::HANDLE_W =>
+                        if at.0 < rect[0] + menu::ROW_PAD_X + font::ACTION_SIZE =>
                     {
-                        Zone::Handle
+                        if self.is_default(project) {
+                            Zone::Handle
+                        } else if self.can_clear(project) {
+                            Zone::Clear
+                        } else {
+                            Zone::Body
+                        }
                     }
                     Row::Item { .. } => Zone::Body,
                     _ => return None,
@@ -575,7 +586,7 @@ impl State {
     fn press(&mut self, left: bool) {
         self.pressed = match self.hover {
             Some(Part::Row(_, Zone::Body)) if self.mode == Mode::Toggle => None,
-            Some(Part::Row(_, Zone::Action)) if !left => None,
+            Some(Part::Row(_, Zone::Action | Zone::Clear)) if !left => None,
             Some(Part::Row(Row::Item { project, .. }, Zone::Handle)) => {
                 if left {
                     self.drag = project;
@@ -608,10 +619,14 @@ impl State {
                     server,
                     project: Some(p),
                 },
-                Zone::Action,
+                zone @ (Zone::Action | Zone::Clear),
             ) => {
-                let default = !self.projects.list()[p].default;
-                self.projects.set_default(p, default, server, &self.servers);
+                if zone == Zone::Action {
+                    let default = !self.projects.list()[p].default;
+                    self.projects.set_default(p, default, server, &self.servers);
+                } else if self.can_clear(Some(p)) {
+                    self.projects.remove_past(p);
+                }
                 self.relayout();
                 self.show_menu();
                 self.rehover();
@@ -726,8 +741,16 @@ impl State {
             // Bottom edge on the top of the label's hover rect, left edges aligned.
             let left = view.left + (strip::LEAD * scale).round() as i32;
             let bottom = view.top + (LABEL_TOP * scale).ceil() as i32;
-            let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
-            SetWindowPos(self.menu, HWND_TOPMOST, left, bottom - h, w, h, flags);
+            let rect = RECT {
+                left,
+                top: bottom - h,
+                right: left + w,
+                bottom,
+            };
+            if self.present_menu(rect) {
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+                SetWindowPos(self.menu, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
         }
         // The label keeps its highlight while the menu is open.
         self.redraw();
@@ -825,6 +848,13 @@ impl State {
         self.starting.iter().any(|start| start.launch.dir == *dir)
     }
 
+    fn can_clear(&self, project: Option<usize>) -> bool {
+        project.is_some_and(|p| {
+            let project = &self.projects.list()[p];
+            !project.default && project.server.is_none() && !self.is_starting(p)
+        })
+    }
+
     /// What a view lists, top to bottom, with a line between groups that have rows.
     fn rows(&self, mode: Mode) -> Vec<Row> {
         let list = self.projects.list();
@@ -917,10 +947,7 @@ impl State {
             + menu::NAME_TO_PORT_MIN
             + self.renderer.measure(&port, style);
         if mode == Mode::Toggle {
-            width += menu::ICON_TO_TEXT + font::ACTION_SIZE;
-            if self.is_default(project) {
-                width += menu::HANDLE_W + menu::ICON_TO_TEXT;
-            }
+            width += 2.0 * (font::ACTION_SIZE + menu::ICON_TO_TEXT);
         }
         width
     }
@@ -970,10 +997,19 @@ impl State {
         });
     }
 
-    fn paint_menu(&self, dc: HDC, size: (i32, i32)) {
+    fn paint_menu(&self) {
+        unsafe {
+            ValidateRect(self.menu, null());
+            let mut rect = zeroed();
+            GetWindowRect(self.menu, &mut rect);
+            self.present_menu(rect);
+        }
+    }
+
+    fn present_menu(&self, rect: RECT) -> bool {
         let r = &self.renderer;
-        let height = size.1 as f32 / self.scale();
-        r.paint(dc, size, self.dpi, color::MENU_BORDER, || {
+        let height = (rect.bottom - rect.top) as f32 / self.scale();
+        r.present(self.menu, rect, self.dpi, color::MENU_BORDER, || {
             let inside = [
                 menu::BORDER,
                 menu::BORDER,
@@ -1015,7 +1051,7 @@ impl State {
                     Row::Item { .. } => self.paint_item(server, project, content, accent),
                 }
             }
-        });
+        })
     }
 
     /// `accent` is the color of the toggle view's icons.
@@ -1038,19 +1074,23 @@ impl State {
             let default = self.is_default(project);
             let action = if default { font::REMOVE } else { font::ADD };
             r.text(action, ACTION_ICON, content, Align::Trailing, accent);
+            text[0] += font::ACTION_SIZE + menu::ICON_TO_TEXT;
             text[2] -= font::ACTION_SIZE + menu::ICON_TO_TEXT;
             if default {
+                let left = content[0] + (font::ACTION_SIZE - menu::HANDLE_W) / 2.0;
                 let top = (content[1] + content[3] - menu::HANDLE_H) / 2.0;
                 for bar in menu::HANDLE_BARS.map(|center| top + center - menu::LINE_H / 2.0) {
-                    let rect = [
-                        content[0],
-                        bar,
-                        content[0] + menu::HANDLE_W,
-                        bar + menu::LINE_H,
-                    ];
+                    let rect = [left, bar, left + menu::HANDLE_W, bar + menu::LINE_H];
                     r.fill(rect, menu::LINE_H / 2.0, accent, 1.0);
                 }
-                text[0] += menu::HANDLE_W + menu::ICON_TO_TEXT;
+            } else if self.can_clear(project) {
+                let icon = [
+                    content[0],
+                    content[1],
+                    content[0] + font::ACTION_SIZE,
+                    content[3],
+                ];
+                r.text(font::CLEAR, ACTION_ICON, icon, Align::Center, accent);
             }
         }
         r.text(name, style, text, Align::Leading, ink);
@@ -1159,7 +1199,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
 unsafe extern "system" fn menu_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match message {
-            WM_PAINT => paint(hwnd, State::paint_menu),
+            WM_PAINT => _ = with(|state| state.paint_menu()),
             WM_ERASEBKGND => return 1,
             WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
             WM_MOUSEMOVE => {

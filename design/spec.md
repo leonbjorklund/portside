@@ -65,8 +65,8 @@ The same panel in the same place as the menu, opened only by right-click > Defau
 
 Top to bottom, with `ROW_GAP` between rows:
 
-1. The latest 10 past runs, most recent first, then running servers that aren't defaults. Each is a `ROW_H` row with name, port and `ADD` at the right.
-2. The defaults, including the strip's server when it is one. Each is a `ROW_H` row with the drag handle at the left, name, port and `REMOVE` at the right.
+1. The latest 10 past runs, most recent first, then running servers that aren't defaults. Each is a `ROW_H` row with name, port and `ADD` at the right. A stopped past run has `CLEAR` at the left; a running or starting row leaves that space empty.
+2. The defaults, including the strip's server when it is one. Each is a `ROW_H` row with the drag handle at the left, name, port and `REMOVE` at the right. Every project row reserves `ACTION_SIZE` at the left, with `ICON_TO_TEXT` before the name, so names align.
 3. A `ROW_H` row with `Close defaults` centered at `MENU_SIZE`, in `TEXT_DIM`.
 
 The line, as in the menu, separates these groups where both sides have rows. Names and ports follow the menu's row styles.
@@ -74,7 +74,8 @@ The line, as in the menu, separates these groups where both sides have rows. Nam
 - **Plus and minus:** `ADD` and `REMOVE` at `ACTION_SIZE`, inset by `ROW_PAD_X`, with `ICON_TO_TEXT` between the port and the icon. They apply immediately, and there is nothing to cancel.
 - **Plus** moves the row to the end of the defaults. It takes that row's port and command, so each running server of a folder that isn't a default has its own plus.
 - **Minus** moves a running row above the line, and a stopped row to the front of the past runs.
-- **Drag handle:** two drawn bars `HANDLE_W` wide and `LINE_H` high, centered at `HANDLE_BARS` in a `HANDLE_H` box, with `ICON_TO_TEXT` between the handle and the name.
+- **Clear:** the Segoe Fluent Icons Clear glyph (`CLEAR`), a plain × at `ACTION_SIZE`, centered in the left column. Clicking it immediately forgets that stopped past run and keeps the view open. The entry stays gone after a restart, but a future run in its folder records it again. Defaults and running or starting rows cannot be cleared.
+- **Drag handle:** two drawn bars `HANDLE_W` wide and `LINE_H` high, centered at `HANDLE_BARS` in a `HANDLE_H` box, horizontally centered in the left column.
 - **Dragging the handle** reorders defaults, and only within the defaults. Rows move as the pointer does. That order is the menu's order, and it survives a restart.
 - Clicking the rest of a row does nothing, and a middle-click does nothing anywhere in the view.
 - Hovering a row gives it `HOVER_ALPHA`, and its icons turn `TEXT`. Hovering Close defaults gives that row `HOVER_ALPHA`, and its text turns `TEXT`. At rest, every icon is `TEXT_DIM`.
