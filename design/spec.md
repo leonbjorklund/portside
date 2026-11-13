@@ -4,7 +4,7 @@ A strip in the Windows taskbar, right of agent-usage-overlay, showing the local 
 
 ## What counts as a server
 
-A TCP port listening on localhost, or on every address (`0.0.0.0`), whose process is a dev runtime (node, bun, deno, python and similar). Each server shows its project folder name (the process's working directory) and its port, for example `portside :3000`. A server started elevated hides its folder, so it shows the runtime's name. Servers are ordered by port.
+A TCP port listening on localhost, or on every address (`0.0.0.0`), whose process is a dev runtime (node, bun, deno, python and similar). Each server shows its project folder name (the recovered launcher's working directory, or the process's own) and its port, for example `portside :3000`. A server started elevated hides its folder, so it shows the runtime's name. Servers are ordered by port.
 
 ## Terms
 
@@ -55,7 +55,8 @@ Above the line are running servers that aren't defaults, ordered by port. Below 
 - **Spinner:** a `SPINNER_SWEEP` arc of radius `SPINNER_RADIUS` and stroke `SPINNER_STROKE` in `TEXT_DIM`, centered in `SPINNER` and turning once per `SPINNER_TURN_MS`.
 - **A start finishes** when a server from its folder listens on the last port, or runs the same saved command on another port, since Vite moves ports. The row turns bright, the browser opens, and it becomes the strip's server.
 - **A start times out** after 60 seconds with neither. The spinner stops, the row returns to dim, and the hidden processes are ended. Nothing else shows.
-- **Start command:** the server's own executable and arguments, in its working directory, with every `node_modules\.bin` from that folder upward and the executable's folder first on `PATH`. A wrapper runtime, such as a venv's `python.exe`, is saved at the topmost parent with the same executable name and working directory. A server started by another listening server in its folder saves the outer server's command, so starting it starts both and waits for the inner server's port. Variables set in the original shell aren't saved.
+- **Start command:** the server's own executable and arguments, in its working directory, with every `node_modules\.bin` from that folder upward and the executable's folder first on `PATH`. A wrapper runtime, such as a venv's `python.exe`, is saved at the topmost parent with the same executable name and working directory. A server started by another listening server in its folder saves the outer server's command, so starting it starts both and waits for the inner server's port.
+- **Recovering a launcher:** extend that command to an observed npm, pnpm or Yarn script runner in the same or an enclosing folder, preserving its executable, arguments and working directory together. Only `cmd.exe` wrappers with optional `/d` and `/s` followed by `/c` bridge runners. Stop extending at an unknown process, interactive shell, missing metadata, exited or reused process, cycle, or eight parents from the server. Keep the best command already found and preserve the distinction between an outer listening server and its inner server. Shell history and shell variables aren't saved. Existing defaults keep their saved commands.
 - **Middle-click a running row:** stops that row's server, as on the label, without making it the strip's server. A default stays in its place, dim.
 - Exit leaves a hidden server running, and the next scan finds it.
 - The menu closes when the pointer leaves both the label and the menu, and on a right-click on either.

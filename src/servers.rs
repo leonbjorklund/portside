@@ -1,5 +1,5 @@
 //! Dev servers: TCP ports listening on localhost (or on every address) whose
-//! process is a dev runtime, named by that process's working directory.
+//! process is a dev runtime, named by the recovered launcher's working directory.
 //! Stopping one sends Ctrl+C to its console, then forces it. A saved command
 //! starts one again with no window.
 
@@ -19,7 +19,10 @@ use std::{
 use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, NO_ERROR, WAIT_OBJECT_0},
+        Foundation::{
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, NO_ERROR, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
         NetworkManagement::IpHelper::{
             GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
             TCP_TABLE_OWNER_PID_LISTENER,
@@ -33,7 +36,7 @@ use windows_sys::{
             },
             Diagnostics::Debug::ReadProcessMemory,
             Threading::{
-                CREATE_NO_WINDOW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                CREATE_NO_WINDOW, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
                 PROCESS_SYNCHRONIZE, PROCESS_VM_READ, QueryFullProcessImageNameW,
                 WaitForSingleObject,
             },
@@ -61,7 +64,7 @@ pub struct Launch {
     pub dir: String,
     pub exe: String,
     pub args: String,
-    /// The command belongs to a listening server that starts this one.
+    /// Another listening server sits between this server and its launcher.
     pub nested: bool,
 }
 
@@ -339,7 +342,7 @@ fn project(pid: u32, listeners: &[(u32, u16, IpAddr)]) -> Option<(String, Option
     if !RUNTIMES.iter().any(|runtime| exe.starts_with(runtime)) {
         return None;
     }
-    let launch = launch(pid, listeners);
+    let launch = launch(pid, listeners, Process::info);
     let name = launch
         .as_ref()
         .map_or(exe.trim_end_matches(".exe"), Launch::name)
@@ -355,36 +358,128 @@ fn project(pid: u32, listeners: &[(u32, u16, IpAddr)]) -> Option<(String, Option
 /// and working directory is a wrapper around it, such as a venv's python.exe,
 /// so the topmost one's command is taken. So is that of an ancestor that is
 /// listening itself, as Tina starts Astro through cmd.exe, and the server is
-/// then marked `nested`.
-fn launch(pid: u32, listeners: &[(u32, u16, IpAddr)]) -> Option<Launch> {
-    let read = |pid| {
-        let process = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
-        Some((process.image()?, process.parameters()?))
-    };
-    let (exe, (dir, line, mut parent)) = read(pid)?;
-    let mut launch = Launch {
-        dir,
-        exe,
-        args: arguments(&line).to_owned(),
-        nested: false,
-    };
-    let mut unbroken = true;
+/// then marked `nested`. From that fallback, accepted cmd wrappers and package
+/// runners can lead to the project's original command, even in a parent folder.
+fn launch(
+    pid: u32,
+    listeners: &[(u32, u16, IpAddr)],
+    mut read: impl FnMut(u32) -> Option<ProcessInfo>,
+) -> Option<Launch> {
+    let mut chain = vec![(pid, read(pid)?)];
     for _ in 0..MAX_ANCESTORS {
-        let Some((exe, (dir, line, next))) = read(parent) else {
+        let (_, child) = chain.last()?;
+        let parent = child.parent;
+        if parent == 0 || chain.iter().any(|&(pid, _)| pid == parent) {
+            break;
+        }
+        let Some(info) = read(parent) else {
             break;
         };
-        let same = file_name(&exe).eq_ignore_ascii_case(file_name(&launch.exe))
-            && dir.eq_ignore_ascii_case(&launch.dir);
-        let listening = listeners.iter().any(|l| l.0 == parent);
+        if info.created > child.created {
+            break;
+        }
+        chain.push((parent, info));
+    }
+
+    let original = &chain[0].1.launch;
+    let mut selected = 0;
+    let mut nested = false;
+    let mut unbroken = true;
+    for (index, (parent, info)) in chain.iter().enumerate().skip(1) {
+        let same = file_name(&info.launch.exe).eq_ignore_ascii_case(file_name(&original.exe))
+            && info.launch.dir.eq_ignore_ascii_case(&original.dir);
+        let listening = listeners.iter().any(|l| l.0 == *parent);
         unbroken &= same;
         if same && (unbroken || listening) {
-            launch.exe = exe;
-            launch.args = arguments(&line).to_owned();
-            launch.nested |= listening;
+            selected = index;
+            nested |= listening;
         }
-        parent = next;
+    }
+    let mut ancestors = chain.into_iter().skip(selected);
+    let mut launch = ancestors.next()?.1.launch;
+    launch.nested = nested;
+    for (pid, info) in ancestors {
+        nested |= listeners.iter().any(|l| l.0 == pid);
+        if command_shell(&info.launch) {
+            continue;
+        }
+        if !package_runner(&info.launch) || !contains_folder(&info.launch.dir, &launch.dir) {
+            break;
+        }
+        launch = info.launch;
+        launch.nested = nested;
     }
     Some(launch)
+}
+
+/// Only noninteractive command wrappers may connect a server to its runner.
+fn command_shell(launch: &Launch) -> bool {
+    if !file_name(&launch.exe).eq_ignore_ascii_case("cmd.exe") {
+        return false;
+    }
+    let mut args = launch.args.as_str();
+    let mut flags = 0;
+    loop {
+        let end = args.find([' ', '\t']).unwrap_or(args.len());
+        let flag = &args[..end];
+        args = args[end..].trim_start_matches([' ', '\t']);
+        if flag.eq_ignore_ascii_case("/c") {
+            return !args.is_empty();
+        }
+        let bit = match flag.to_ascii_lowercase().as_str() {
+            "/d" => 1,
+            "/s" => 2,
+            _ => return false,
+        };
+        if flags & bit != 0 {
+            return false;
+        }
+        flags |= bit;
+    }
+}
+
+fn package_runner(launch: &Launch) -> bool {
+    if !file_name(&launch.exe).eq_ignore_ascii_case("node.exe") {
+        return false;
+    }
+    let args = launch.args.trim_start_matches([' ', '\t']);
+    let script = if let Some(quoted) = args.strip_prefix('"') {
+        let Some((script, rest)) = quoted.split_once('"') else {
+            return false;
+        };
+        if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+            return false;
+        }
+        script
+    } else {
+        args.split([' ', '\t']).next().unwrap_or_default()
+    };
+    let script = script.replace('/', "\\").to_ascii_lowercase();
+    [
+        r"node_modules\npm\bin\npm-cli.js",
+        r"node_modules\pnpm\bin\pnpm.cjs",
+        r"node_modules\pnpm\bin\pnpm.mjs",
+        r"node_modules\yarn\bin\yarn.js",
+        r"node_modules\@yarnpkg\cli-dist\bin\yarn.js",
+    ]
+    .iter()
+    .any(|suffix| {
+        script
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('\\'))
+    })
+}
+
+fn contains_folder(parent: &str, child: &str) -> bool {
+    let mut child = Path::new(child).components();
+    Path::new(parent).is_absolute()
+        && Path::new(parent).components().all(|part| {
+            child.next().is_some_and(|child| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&child.as_os_str().to_string_lossy())
+            })
+        })
 }
 
 /// A command line without argv[0].
@@ -402,10 +497,45 @@ fn file_name(path: &str) -> &str {
 
 struct Process(HANDLE);
 
+struct ProcessInfo {
+    launch: Launch,
+    parent: u32,
+    created: u64,
+}
+
 impl Process {
     fn open(pid: u32, access: u32) -> Option<Self> {
         let handle = unsafe { OpenProcess(access, 0, pid) };
         (!handle.is_null()).then(|| Self(handle))
+    }
+
+    fn info(pid: u32) -> Option<ProcessInfo> {
+        let process = Self::open(
+            pid,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_SYNCHRONIZE,
+        )?;
+        let exe = process.image()?;
+        let (dir, line, parent) = process.parameters()?;
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let timed = unsafe {
+            GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user)
+        };
+        if timed == 0 || unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
+            return None;
+        }
+        Some(ProcessInfo {
+            launch: Launch {
+                dir,
+                exe,
+                args: arguments(&line).to_owned(),
+                nested: false,
+            },
+            parent,
+            created: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+        })
     }
 
     fn image(&self) -> Option<String> {
@@ -479,7 +609,255 @@ impl Drop for Process {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::net::TcpListener;
+
+    fn process(pid: u32, parent: u32, dir: &str, exe: &str, args: &str) -> (u32, ProcessInfo) {
+        (
+            pid,
+            ProcessInfo {
+                launch: Launch {
+                    dir: dir.into(),
+                    exe: exe.into(),
+                    args: args.into(),
+                    nested: false,
+                },
+                parent,
+                created: 100 - u64::from(pid),
+            },
+        )
+    }
+
+    fn recover(chain: Vec<(u32, ProcessInfo)>, listening: &[u32]) -> Launch {
+        let chain: HashMap<_, _> = chain.into_iter().collect();
+        let listeners: Vec<_> = listening
+            .iter()
+            .map(|&pid| (pid, 3000, Ipv4Addr::LOCALHOST.into()))
+            .collect();
+        launch(1, &listeners, |pid| {
+            let info = chain.get(&pid)?;
+            Some(ProcessInfo {
+                launch: info.launch.clone(),
+                parent: info.parent,
+                created: info.created,
+            })
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn recovers_the_root_launcher_across_nested_scripts_and_a_port_change() {
+        let root = r"C:\design-kit\";
+        let preview = r"C:\design-kit\preview\";
+        let node = r"C:\Program Files\nodejs\node.exe";
+        let runner = r#""C:\User Files\npm\\node_modules\pnpm\bin\pnpm.mjs" "dev""#;
+        let saved = recover(
+            vec![
+                process(1, 2, preview, node, "vite.js dev --port 4176"),
+                process(2, 3, preview, "cmd.exe", "/d /s /c vite dev --port 4176"),
+                process(
+                    3,
+                    4,
+                    root,
+                    node,
+                    &runner.replace("\"dev\"", "-C preview dev"),
+                ),
+                process(4, 5, root, "cmd.exe", "/d /s /c pnpm -C preview dev"),
+                process(5, 6, root, node, runner),
+                process(6, 7, root, "cmd.exe", "/d /s /c pnpm.cmd dev"),
+                process(7, 0, root, "Claude.exe", ""),
+            ],
+            &[1],
+        );
+        assert_eq!(saved.dir, root);
+        assert_eq!(saved.exe, node);
+        assert_eq!(saved.args, runner);
+        assert!(!saved.nested);
+        let running = Server {
+            port: 4177,
+            name: saved.name().into(),
+            address: Ipv4Addr::LOCALHOST.into(),
+            launch: Some(saved.clone()),
+        };
+        assert!(running.runs(&saved, 4176));
+    }
+
+    #[test]
+    fn recovers_supported_runners_without_changing_their_arguments() {
+        for (script, shell) in [
+            (r"C:\Program Files\node_modules\npm\bin\npm-cli.js", "/c"),
+            (r"C:\tools\node_modules\pnpm\bin\pnpm.cjs", "/d /c"),
+            (r"C:/tools/NODE_MODULES/PNPM/bin/pnpm.mjs", "/s /c"),
+            (r"C:\tools\node_modules\yarn\bin\yarn.js", "/d /s /c"),
+            (
+                r"C:\tools\node_modules\@yarnpkg\cli-dist\bin\yarn.js",
+                "/S /D /C",
+            ),
+        ] {
+            let args = format!(r#""{script}" run storybook -- --title "two words""#);
+            let found = recover(
+                vec![
+                    process(1, 2, r"C:\app\child\", "node.exe", "serve.js"),
+                    process(2, 3, r"C:\app\child\", "cmd.exe", &format!("{shell} serve")),
+                    process(3, 0, r"c:/APP/", "NODE.EXE", &args),
+                ],
+                &[1],
+            );
+            assert_eq!(found.args, args, "{script}");
+            assert_eq!(found.exe, "NODE.EXE");
+            assert_eq!(found.dir, r"c:/APP/");
+        }
+    }
+
+    #[test]
+    fn unknown_commands_and_unrelated_folders_stop_runner_recovery() {
+        let runner = r"C:\tools\node_modules\npm\bin\npm-cli.js run site";
+        for (exe, args, dir) in [
+            ("cmd.exe", "/k serve", r"C:\app\"),
+            ("cmd.exe", "/c   ", r"C:\app\"),
+            ("cmd.exe", "/q /c serve", r"C:\app\"),
+            ("cmd.exe", "/d /d /c serve", r"C:\app\"),
+            ("powershell.exe", "-Command serve", r"C:\app\"),
+            ("Claude.exe", "", r"C:\app\"),
+            ("node.exe", "agent.js", r"C:\app\"),
+            (
+                "node.exe",
+                "unknown.js --config node_modules\\npm\\bin\\npm-cli.js",
+                r"C:\app\",
+            ),
+            (
+                "node.exe",
+                r"C:\notnode_modules\npm\bin\npm-cli.js run site",
+                r"C:\app\",
+            ),
+            (
+                "node.exe",
+                r#""C:\node_modules\npm\bin\npm-cli.js"suffix run site"#,
+                r"C:\app\",
+            ),
+            ("bun.exe", runner, r"C:\app\"),
+            ("node.exe", runner, r"C:\other\"),
+            ("node.exe", runner, r"C:\ap\"),
+        ] {
+            let found = recover(
+                vec![
+                    process(1, 2, r"C:\app\", "node.exe", "serve.js"),
+                    process(2, 3, r"C:\app\", "cmd.exe", "/c serve"),
+                    process(3, 4, dir, exe, args),
+                    process(4, 5, r"C:\app\", "cmd.exe", "/c runner"),
+                    process(5, 0, r"C:\app\", "node.exe", runner),
+                ],
+                &[1],
+            );
+            assert_eq!(found.args, "serve.js", "{exe} {args} in {dir}");
+        }
+    }
+
+    #[test]
+    fn unverifiable_ancestry_retains_the_last_valid_launcher() {
+        let runner = r"C:\tools\node_modules\pnpm\bin\pnpm.cjs run site";
+        for boundary in ["missing", "reused", "cycle", "depth"] {
+            let mut chain = vec![
+                process(1, 2, r"C:\app\", "node.exe", "serve.js"),
+                process(2, 3, r"C:\app\", "cmd.exe", "/c serve"),
+                process(3, 4, r"C:\app\", "node.exe", runner),
+            ];
+            match boundary {
+                "reused" => {
+                    let mut reused =
+                        process(4, 0, r"C:\app\", "node.exe", &format!("{runner} outer"));
+                    reused.1.created = 1000;
+                    chain.push(reused);
+                }
+                "cycle" => {
+                    chain.push(process(4, 1, r"C:\app\", "cmd.exe", "/c runner"));
+                    for (_, info) in &mut chain {
+                        info.created = 1;
+                    }
+                }
+                "depth" => {
+                    for pid in 4..=9 {
+                        chain.push(process(pid, pid + 1, r"C:\app\", "cmd.exe", "/c runner"));
+                    }
+                    chain.push(process(
+                        10,
+                        0,
+                        r"C:\app\",
+                        "node.exe",
+                        &format!("{runner} outer"),
+                    ));
+                }
+                _ => {}
+            }
+            assert_eq!(recover(chain, &[1]).args, runner, "{boundary}");
+        }
+    }
+
+    #[test]
+    fn preserves_direct_commands_python_wrappers_and_nested_endpoints() {
+        for (exe, args) in [
+            (
+                "node.exe",
+                "./node_modules/@angular/cli/bin/ng serve -c development",
+            ),
+            ("python.exe", "-m http.server 8000"),
+        ] {
+            let found = recover(vec![process(1, 0, r"C:\site\", exe, args)], &[1]);
+            assert_eq!((found.exe.as_str(), found.args.as_str()), (exe, args));
+            assert!(!found.nested);
+        }
+        let python = recover(
+            vec![
+                process(
+                    1,
+                    2,
+                    r"C:\site\",
+                    r"C:\Python\python.exe",
+                    "-m http.server 8000",
+                ),
+                process(
+                    2,
+                    0,
+                    r"C:\site\",
+                    r"C:\site\.venv\Scripts\python.exe",
+                    "-m http.server 8000",
+                ),
+            ],
+            &[1],
+        );
+        assert_eq!(python.exe, r"C:\site\.venv\Scripts\python.exe");
+
+        let runner = r"C:\tools\node_modules\pnpm\bin\pnpm.cjs dev";
+        let tina_launch = recover(
+            vec![
+                process(1, 2, r"C:\site\", "node.exe", "tina.js"),
+                process(2, 3, r"C:\site\", "cmd.exe", "/c tina"),
+                process(3, 0, r"C:\site\", "node.exe", runner),
+            ],
+            &[1],
+        );
+        let astro_launch = recover(
+            vec![
+                process(1, 2, r"C:\site\", "node.exe", "astro.js"),
+                process(2, 3, r"C:\site\", "cmd.exe", "/c astro"),
+                process(3, 4, r"C:\site\", "node.exe", "tina.js"),
+                process(4, 5, r"C:\site\", "cmd.exe", "/c tina"),
+                process(5, 0, r"C:\site\", "node.exe", runner),
+            ],
+            &[1, 3],
+        );
+        assert_eq!(tina_launch.args, runner);
+        assert!(!tina_launch.nested);
+        assert_eq!(astro_launch.args, runner);
+        assert!(astro_launch.nested);
+        let tina = Server {
+            port: 4001,
+            name: "site".into(),
+            address: Ipv4Addr::LOCALHOST.into(),
+            launch: Some(tina_launch),
+        };
+        assert!(!tina.runs(&astro_launch, 4321));
+    }
 
     #[test]
     fn opens_listeners_at_the_expected_host() {
