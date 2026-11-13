@@ -39,13 +39,15 @@ The count, name and port are all `STRIP_SIZE`, agent-usage-overlay's text size, 
 
 ## Server menu
 
-After the pointer rests on the label for `SHOW_DELAY_MS`, the menu opens if it has a row besides the strip's server. With one server running and no stopped defaults there is no menu, and an open menu closes if its rows drop to that. With no servers running and at least one default, hovering the globe opens it.
+After the pointer rests on the label for `SHOW_DELAY_MS`, the menu opens if it has a row besides the strip's server, or the strip's server has a branch to show. With one server running, no branch and no stopped defaults there is no menu, and an open menu closes if its rows drop to that. With no servers running and at least one default, hovering the globe opens it.
 
 Its bottom edge touches the top of the label's hover rect, left edges aligned, so the pointer can move straight up into it. It fits its widest row, measured across the rows of this menu and the toggle view together, so switching views keeps one width. It is at least `MIN_W` wide and at least as wide as the label is with the widest server, so cycling never changes its width. Nothing limits it to the screen. The label keeps its hover background while the menu is open.
 
 Above the line are running servers that aren't defaults, ordered by port. Below it are the defaults, in the user's order. The line is `LINE_H` of `MENU_BORDER`, with `LINE_MARGIN` above and below, inset by `ROW_PAD_X`, and it appears only when both groups have rows. The strip's server always has a row, in its normal place.
 
 - **Row styles:** name left, port right, at `MENU_SIZE`. A running row's name and port are `TEXT`. A stopped row's are `STOPPED`, and it shows its last port. A row that isn't a default is italic.
+- **Branch:** a running server's current Git branch follows the project name on the left, separated by ` · `, for example `Portal.Frontend · config-tab-icons`. The port stays right-aligned, with `NAME_TO_PORT_MIN` separating it from the combined label. The branch and separator use `TEXT` and the italic face at `MENU_SIZE`. Both menu views fit the full label; the taskbar strip stays name-and-port only. Stopped and starting projects show no branch or separator.
+- **Branch refresh:** background Git lookups refresh the launch folders through the one-second poll. Switching branches updates the menu without restarting the server or writing project history. A branch names the current checkout, not necessarily the server's compiled output. Detached checkouts, non-Git or unreadable folders, missing Git and failed lookups keep the name and port without a branch. Each lookup times out after two seconds; branch updates wait until an active click or drag ends.
 - **A default's server:** the server on its last port, or else one running its saved command on another port, which then becomes its last port. Any other server in its folder is a running row of its own.
 - **Highlight:** while the pointer is on the strip, the strip's server's row has the `HOVER_ALPHA` background. While the pointer is on a row, only that row has it.
 - **Click a running row:** opens that server and makes it the strip's server.
@@ -69,7 +71,7 @@ Top to bottom, with `ROW_GAP` between rows:
 2. The defaults, including the strip's server when it is one. Each is a `ROW_H` row with the drag handle at the left, name, port and `REMOVE` at the right. Every project row reserves `ACTION_SIZE` at the left, with `ICON_TO_TEXT` before the name, so names align.
 3. A `ROW_H` row with `Close defaults` centered at `MENU_SIZE`, in `TEXT_DIM`.
 
-The line, as in the menu, separates these groups where both sides have rows. Names and ports follow the menu's row styles.
+The line, as in the menu, separates these groups where both sides have rows. Names, branches and ports follow the menu's row styles.
 
 - **Plus and minus:** `ADD` and `REMOVE` at `ACTION_SIZE`, inset by `ROW_PAD_X`, with `ICON_TO_TEXT` between the port and the icon. They apply immediately, and there is nothing to cancel.
 - **Plus** moves the row to the end of the defaults. It takes that row's port and command, so each running server of a folder that isn't a default has its own plus.
@@ -86,7 +88,7 @@ The line, as in the menu, separates these groups where both sides have rows. Nam
 | State                   | What shows                                                               |
 | ----------------------- | ------------------------------------------------------------------------ |
 | Two or more servers     | Globe, count, name and port                                              |
-| One server              | Globe, name and port; no count, and a menu only with a stopped default   |
+| One server              | Globe, name and port; no count, and a menu with a branch or stopped default |
 | No servers, defaults    | Only the globe, in `GLOBE_EMPTY`; it hovers and opens the menu           |
 | No servers, no defaults | Only the globe, in `GLOBE_EMPTY`; nothing hovers                         |
 

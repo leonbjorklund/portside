@@ -8,7 +8,7 @@ pub mod font {
     pub const FAMILY: &str = "Atkinson Hyperlegible";
     pub const REGULAR: &[u8] =
         include_bytes!("../assets/fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Regular.ttf");
-    /// Rows of projects that are not defaults.
+    /// Menu branches and rows of projects that are not defaults.
     pub const ITALIC: &[u8] =
         include_bytes!("../assets/fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Italic.ttf");
     /// The one weight, used by both faces (DWRITE_FONT_WEIGHT_NORMAL).
@@ -38,7 +38,7 @@ pub mod color {
 
     pub const TASKBAR: Rgb = 0x1c1c1c;
     pub const TEXT: Rgb = 0xf1f3f4;
-    /// Count and port.
+    /// Strip count and port.
     pub const TEXT_DIM: Rgb = 0x9c9c9c;
     /// Hover and pressed backgrounds are this white drawn over the background.
     pub const HOVER: Rgb = 0xffffff;

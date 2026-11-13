@@ -2,6 +2,7 @@
 //! the UI thread. Window procedures reach the shared state through `with`.
 
 use crate::{
+    branches::Branches,
     projects::Projects,
     render::{Align, Face, Rect, Renderer, Style},
     servers::{self, Scanner, Server, Starting},
@@ -119,6 +120,7 @@ struct Layout {
 struct State {
     renderer: Renderer,
     scanner: Scanner,
+    branches: Branches,
     servers: Vec<Server>,
     projects: Projects,
     /// Saved commands that have not listened yet.
@@ -191,6 +193,7 @@ pub fn run() -> Result<(), String> {
     STATE.set(Some(State {
         renderer,
         scanner: Scanner::default(),
+        branches: Branches::new(),
         servers: Vec::new(),
         projects: Projects::load(),
         starting: Vec::new(),
@@ -425,6 +428,22 @@ impl State {
         }
         for server in &started {
             self.open(server);
+        }
+        // Keep menu geometry still while a click or drag is in progress.
+        if self.pressed.is_none() && self.drag.is_none() {
+            let dirs = self
+                .servers
+                .iter()
+                .filter_map(|server| server.launch.as_ref().map(|launch| launch.dir.clone()))
+                .collect();
+            if self.branches.refresh(dirs) {
+                if self.menu_open() {
+                    self.show_menu();
+                    self.rehover();
+                } else if self.hover == Some(Part::Label) {
+                    unsafe { SetTimer(self.menu, SHOW, menu::SHOW_DELAY_MS, None) };
+                }
+            }
         }
     }
 
@@ -711,7 +730,9 @@ impl State {
             .iter()
             .filter(|row| matches!(row, Row::Item { .. }))
             .count();
-        if (self.mode == Mode::Normal && items <= usize::from(!self.servers.is_empty()))
+        if (self.mode == Mode::Normal
+            && items <= usize::from(!self.servers.is_empty())
+            && self.branch(self.current).is_none())
             || self.view.is_null()
         {
             return self.hide_menu();
@@ -921,8 +942,13 @@ impl State {
             .collect()
     }
 
-    /// An item's name, port and text style.
-    fn item(&self, server: Option<usize>, project: Option<usize>) -> (&str, String, Style) {
+    fn branch(&self, server: usize) -> Option<&str> {
+        let launch = self.servers.get(server)?.launch.as_ref()?;
+        self.branches.get(&launch.dir)
+    }
+
+    /// An item's name, branch, port and text style.
+    fn item(&self, server: Option<usize>, project: Option<usize>) -> (&str, String, String, Style) {
         let saved = project.map(|p| &self.projects.list()[p]);
         let (name, port) = match (server.map(|i| &self.servers[i]), saved) {
             (Some(running), _) => (running.name.as_str(), running.port),
@@ -934,7 +960,10 @@ impl State {
         } else {
             MENU_ITALIC
         };
-        (name, format!(":{port}"), style)
+        let branch = server
+            .and_then(|i| self.branch(i))
+            .map_or_else(String::new, |branch| format!(" · {branch}"));
+        (name, branch, format!(":{port}"), style)
     }
 
     /// An item's content width in `mode`. Other rows fit in any panel.
@@ -942,9 +971,10 @@ impl State {
         let Row::Item { server, project } = row else {
             return 0.0;
         };
-        let (name, port, style) = self.item(server, project);
+        let (name, branch, port, style) = self.item(server, project);
         let mut width = self.renderer.measure(name, style)
             + menu::NAME_TO_PORT_MIN
+            + self.renderer.measure(&branch, MENU_ITALIC)
             + self.renderer.measure(&port, style);
         if mode == Mode::Toggle {
             width += 2.0 * (font::ACTION_SIZE + menu::ICON_TO_TEXT);
@@ -1063,7 +1093,7 @@ impl State {
         accent: Rgb,
     ) {
         let r = &self.renderer;
-        let (name, port, style) = self.item(server, project);
+        let (name, branch, port, style) = self.item(server, project);
         let ink = if server.is_some() {
             color::TEXT
         } else {
@@ -1093,7 +1123,16 @@ impl State {
                 r.text(font::CLEAR, ACTION_ICON, icon, Align::Center, accent);
             }
         }
+        let mut branch_rect = text;
+        branch_rect[0] += r.measure(name, style);
         r.text(name, style, text, Align::Leading, ink);
+        r.text(
+            &branch,
+            MENU_ITALIC,
+            branch_rect,
+            Align::Leading,
+            color::TEXT,
+        );
         r.text(&port, style, text, Align::Trailing, ink);
         if server.is_none() && project.is_some_and(|p| self.is_starting(p)) {
             let right = text[2] - r.measure(&port, style) - menu::ICON_TO_TEXT;

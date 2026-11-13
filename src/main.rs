@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod branches;
 mod fetch;
 mod instance;
 mod json;
