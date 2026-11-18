@@ -7,11 +7,17 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
+    fs::OpenOptions,
+    mem::zeroed,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::windows::process::CommandExt,
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     path::Path,
-    process::{Child, Command, Stdio},
-    ptr::null_mut,
+    process::{Command, Stdio},
+    ptr::{null, null_mut},
     sync::Mutex,
     thread,
     time::{Duration, Instant},
@@ -20,9 +26,10 @@ use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, NO_ERROR, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
+            NO_ERROR, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
+        Globalization::{CSTR_EQUAL, CompareStringOrdinal},
         NetworkManagement::IpHelper::{
             GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
             TCP_TABLE_OWNER_PID_LISTENER,
@@ -35,10 +42,15 @@ use windows_sys::{
                 SetStdHandle,
             },
             Diagnostics::Debug::ReadProcessMemory,
+            JobObjects::{CreateJobObjectW, TerminateJobObject},
             Threading::{
-                CREATE_NO_WINDOW, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, PROCESS_VM_READ, QueryFullProcessImageNameW,
-                WaitForSingleObject,
+                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+                DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetProcessTimes,
+                InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
+                QueryFullProcessImageNameW, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+                UpdateProcThreadAttribute, WaitForSingleObject,
             },
         },
     },
@@ -70,7 +82,26 @@ pub struct Launch {
 
 impl Launch {
     pub fn name(&self) -> &str {
-        file_name(self.dir.trim_end_matches('\\'))
+        file_name(self.dir.trim_end_matches(['\\', '/']))
+    }
+
+    /// Prefer the saved port, then the first matching command on another port.
+    /// A nested endpoint and its outer server can share the same launcher.
+    pub fn find_server(&self, servers: &[Server], port: u16) -> Option<usize> {
+        let mut moved = None;
+        for (index, server) in servers.iter().enumerate() {
+            let Some(own) = &server.launch else { continue };
+            if !own.dir.eq_ignore_ascii_case(&self.dir) {
+                continue;
+            }
+            if server.port == port {
+                return Some(index);
+            }
+            if own.exe == self.exe && own.args == self.args && own.nested == self.nested {
+                moved.get_or_insert(index);
+            }
+        }
+        moved
     }
 }
 
@@ -82,24 +113,25 @@ pub struct Server {
     pub address: IpAddr,
     /// None when the process's memory can't be read (an elevated one).
     pub launch: Option<Launch>,
+    /// Identifies the listener when its project folder is unavailable.
+    pub pid: u32,
 }
 
 impl Server {
+    /// A project can serve the same port from separate IPv4 and IPv6 processes.
+    pub fn same_endpoint(&self, other: &Self) -> bool {
+        self.port == other.port
+            && match (&self.launch, &other.launch) {
+                (Some(a), Some(b)) => a.dir.eq_ignore_ascii_case(&b.dir),
+                (None, None) => self.pid == other.pid,
+                _ => false,
+            }
+    }
+
     pub fn in_folder(&self, dir: &str) -> bool {
         self.launch
             .as_ref()
             .is_some_and(|launch| launch.dir.eq_ignore_ascii_case(dir))
-    }
-
-    /// Whether this is the server saved as `launch` on `port`: the same port,
-    /// or the same command on another, since Vite moves ports. `nested` is part
-    /// of the command, so Tina's own :4001 never counts as Astro's :4321.
-    pub fn runs(&self, launch: &Launch, port: u16) -> bool {
-        let same_command = |own: &Launch| {
-            (&own.exe, &own.args, own.nested) == (&launch.exe, &launch.args, launch.nested)
-        };
-        self.in_folder(&launch.dir)
-            && (self.port == port || self.launch.as_ref().is_some_and(same_command))
     }
 
     pub fn url(&self, shared: bool) -> String {
@@ -136,6 +168,7 @@ impl Scanner {
                         name,
                         address,
                         launch,
+                        pid,
                     })
                 });
                 Some(Server {
@@ -145,16 +178,30 @@ impl Scanner {
             })
             .collect();
         servers.sort();
-        // One project listening on both IPv4 and IPv6 from two processes.
-        servers.dedup_by(|a, b| (a.port, &a.name) == (b.port, &b.name));
-        servers
+        // A different folder with the same display name can sort between
+        // the IPv4 and IPv6 entries. Keep the first address of each project.
+        let mut rows: Vec<Server> = Vec::new();
+        for server in servers {
+            if !rows
+                .iter()
+                .rev()
+                .take_while(|row| row.port == server.port)
+                .any(|row| server.same_endpoint(row))
+            {
+                rows.push(server);
+            }
+        }
+        rows
     }
 
     /// Stops a server from the last scan, each of its processes on its own
     /// thread: one project can listen on IPv4 and IPv6 from two.
     pub fn stop(&self, server: &Server) {
         for (&(pid, port), known) in &self.known {
-            if port == server.port && known.as_ref().is_some_and(|k| k.name == server.name) {
+            if known
+                .as_ref()
+                .is_some_and(|entry| entry.same_endpoint(server))
+            {
                 thread::spawn(move || stop_process(pid, port));
             }
         }
@@ -165,7 +212,8 @@ impl Scanner {
 pub struct Starting {
     pub launch: Launch,
     pub port: u16,
-    child: Child,
+    /// Closing the job leaves its processes running; only a timeout ends them.
+    job: OwnedHandle,
     since: Instant,
 }
 
@@ -174,35 +222,133 @@ impl Starting {
         self.since.elapsed() >= START_TIMEOUT
     }
 
-    /// Holding `child` through taskkill keeps its ID from being reused.
+    /// The job retains every descendant even after its launcher has exited.
     pub fn end(self) {
-        thread::spawn(move || taskkill(self.child.id()));
+        unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) };
     }
 }
 
 /// Runs a saved command with no window. Its hidden console still takes Ctrl+C.
 pub fn start(launch: &Launch, port: u16) -> Option<Starting> {
-    let mut command = Command::new(&launch.exe);
-    command
-        .raw_arg(&launch.args)
-        .current_dir(&launch.dir)
-        .env("PATH", search_path(launch))
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // A child inherits Portside's ignoring of Ctrl+C. The lock keeps that
-    // from lapsing while Portside is attached to a server's console.
-    let _attached = CONSOLE.lock();
-    unsafe { SetConsoleCtrlHandler(None, 0) };
-    let child = command.spawn();
-    unsafe { SetConsoleCtrlHandler(None, 1) };
+    if [&launch.exe, &launch.args, &launch.dir]
+        .iter()
+        .any(|s| s.contains('\0'))
+    {
+        return None;
+    }
+    let exe = crate::wide(&launch.exe);
+    let dir = crate::wide(&launch.dir);
+    let mut command = crate::wide(&format!("\"{}\" {}", launch.exe, launch.args));
+    let environment = start_environment(launch);
+    let stdio = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(r"\\.\NUL")
+        .ok()?;
+    let job = unsafe { CreateJobObjectW(null(), null()) };
+    if job.is_null() {
+        return None;
+    }
+    let job = unsafe { OwnedHandle::from_raw_handle(job) };
+    let job_handle = job.as_raw_handle();
+    let stdio_handle = stdio.as_raw_handle();
+    // Assign the job at creation, before the launcher can spawn children, and
+    // inherit only NUL, never another worker's pipes or process handles.
+    let mut bytes = 0;
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
+    if bytes == 0 {
+        return None;
+    }
+    let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+    let attributes = storage.as_mut_ptr().cast();
+    if unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &mut bytes) } == 0 {
+        return None;
+    }
+    let created = (|| unsafe {
+        if SetHandleInformation(stdio_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            return false;
+        }
+        for (attribute, handle) in [
+            (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &stdio_handle),
+            (PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handle),
+        ] {
+            if UpdateProcThreadAttribute(
+                attributes,
+                0,
+                attribute as usize,
+                (handle as *const HANDLE).cast(),
+                size_of::<HANDLE>(),
+                null_mut(),
+                null(),
+            ) == 0
+            {
+                return false;
+            }
+        }
+        let mut startup: STARTUPINFOEXW = zeroed();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdio_handle;
+        startup.StartupInfo.hStdOutput = stdio_handle;
+        startup.StartupInfo.hStdError = stdio_handle;
+        startup.lpAttributeList = attributes;
+        let mut process: PROCESS_INFORMATION = zeroed();
+        // A child inherits Portside's ignoring of Ctrl+C. The lock keeps that
+        // from lapsing while Portside is attached to a server's console.
+        let _attached = CONSOLE.lock();
+        SetConsoleCtrlHandler(None, 0);
+        let created = CreateProcessW(
+            exe.as_ptr(),
+            command.as_mut_ptr(),
+            null(),
+            null(),
+            1,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            environment.as_ptr().cast(),
+            dir.as_ptr(),
+            &startup.StartupInfo,
+            &mut process,
+        );
+        SetConsoleCtrlHandler(None, 1);
+        if created == 0 {
+            return false;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        true
+    })();
+    unsafe { DeleteProcThreadAttributeList(attributes) };
+    if !created {
+        return None;
+    }
     Some(Starting {
         launch: launch.clone(),
         port,
-        child: child.ok()?,
+        job,
         since: Instant::now(),
     })
+}
+
+/// Windows expects a case-insensitively sorted, double-NUL-terminated block.
+fn start_environment(launch: &Launch) -> Vec<u16> {
+    let mut vars: Vec<_> = env::vars_os()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case("PATH"))
+        .chain([(OsString::from("PATH"), search_path(launch))])
+        .map(|(key, value)| (key.encode_wide().collect::<Vec<_>>(), value))
+        .collect();
+    vars.sort_unstable_by(|(a, _), (b, _)| unsafe {
+        CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1)
+            .cmp(&CSTR_EQUAL)
+    });
+    let mut block = Vec::new();
+    for (key, value) in vars {
+        block.extend(key);
+        block.push('=' as u16);
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 /// PATH with every `node_modules\.bin` from the project folder upward and the
@@ -232,20 +378,15 @@ fn stop_process(pid: u32, port: u16) {
     let exited =
         ctrl_c(pid) && unsafe { WaitForSingleObject(process.0, STOP_WAIT_MS) } == WAIT_OBJECT_0;
     if !exited {
-        taskkill(pid);
+        // Another stop may have swapped Portside's standard handles for its console's.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-}
-
-/// Ends `pid` and every process it started. No standard handles, which another
-/// stop may have swapped for its server's console.
-fn taskkill(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 /// Sends Ctrl+C to every process in `pid`'s console, Portside included while
@@ -337,7 +478,9 @@ fn rows<T>(table: &[u32]) -> &[T] {
 /// process. A server whose memory can't be read (an elevated one) shows its
 /// runtime name.
 fn project(pid: u32, listeners: &[(u32, u16, IpAddr)]) -> Option<(String, Option<Launch>)> {
-    let image = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.image()?;
+    // Keep the listener's process ID alive through the command lookup.
+    let process = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let image = process.image()?;
     let exe = file_name(&image).to_ascii_lowercase();
     if !RUNTIMES.iter().any(|runtime| exe.starts_with(runtime)) {
         return None;
@@ -474,11 +617,9 @@ fn contains_folder(parent: &str, child: &str) -> bool {
     let mut child = Path::new(child).components();
     Path::new(parent).is_absolute()
         && Path::new(parent).components().all(|part| {
-            child.next().is_some_and(|child| {
-                part.as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&child.as_os_str().to_string_lossy())
-            })
+            child
+                .next()
+                .is_some_and(|child| part.as_os_str().eq_ignore_ascii_case(child.as_os_str()))
         })
 }
 
@@ -492,7 +633,7 @@ fn arguments(line: &str) -> &str {
 }
 
 fn file_name(path: &str) -> &str {
-    path.rsplit('\\').next().unwrap_or(path)
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
 struct Process(HANDLE);
@@ -675,11 +816,12 @@ mod tests {
         assert!(!saved.nested);
         let running = Server {
             port: 4177,
+            pid: 1,
             name: saved.name().into(),
             address: Ipv4Addr::LOCALHOST.into(),
             launch: Some(saved.clone()),
         };
-        assert!(running.runs(&saved, 4176));
+        assert_eq!(saved.find_server(&[running], 4176), Some(0));
     }
 
     #[test]
@@ -706,6 +848,7 @@ mod tests {
             assert_eq!(found.args, args, "{script}");
             assert_eq!(found.exe, "NODE.EXE");
             assert_eq!(found.dir, r"c:/APP/");
+            assert_eq!(found.name(), "APP");
         }
     }
 
@@ -852,11 +995,12 @@ mod tests {
         assert!(astro_launch.nested);
         let tina = Server {
             port: 4001,
+            pid: 1,
             name: "site".into(),
             address: Ipv4Addr::LOCALHOST.into(),
             launch: Some(tina_launch),
         };
-        assert!(!tina.runs(&astro_launch, 4321));
+        assert_eq!(astro_launch.find_server(&[tina], 4321), None);
     }
 
     #[test]
@@ -876,6 +1020,7 @@ mod tests {
                 .unwrap();
             let server = super::Server {
                 port,
+                pid: std::process::id(),
                 name: "test".into(),
                 address,
                 launch: None,
@@ -891,6 +1036,96 @@ mod tests {
                 "{listen}"
             );
         }
+    }
+
+    #[test]
+    fn stopping_a_project_keeps_another_with_the_same_name_and_port_running() {
+        use std::{
+            io::{BufRead, BufReader},
+            process::Child,
+        };
+
+        struct Listener(Child);
+        impl Drop for Listener {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let listen = |ip: &str, port: u16| {
+            let script = format!(
+                "$ErrorActionPreference='Stop'; \
+                 $s=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse('{ip}'),{port}); \
+                 $s.Start(); [Console]::WriteLine($s.LocalEndpoint.Port); [Console]::ReadLine()"
+            );
+            let child = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut listener = Listener(child);
+            let mut line = String::new();
+            BufReader::new(listener.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            (listener, line.trim().parse::<u16>().unwrap())
+        };
+        let (selected, port) = listen("127.0.0.1", 0);
+        let (other, _) = listen("127.0.0.2", port);
+        let (selected_v6, _) = listen("::1", port);
+        let mut scanner = Scanner::default();
+        let selected_dir = r"C:\one\shared";
+        let other_dir = r"C:\two\shared";
+        // Seed the fixture processes' launch metadata; the TCP table and stop are real.
+        for (child, ip, dir) in [
+            (&selected, "127.0.0.1", selected_dir),
+            (&other, "127.0.0.2", other_dir),
+            (&selected_v6, "::1", selected_dir),
+        ] {
+            let launch = Launch {
+                dir: dir.into(),
+                exe: "powershell.exe".into(),
+                args: String::new(),
+                nested: false,
+            };
+            scanner.known.insert(
+                (child.0.id(), port),
+                Some(Server {
+                    port,
+                    pid: child.0.id(),
+                    name: launch.name().into(),
+                    address: ip.parse().unwrap(),
+                    launch: Some(launch),
+                }),
+            );
+        }
+        let rows: Vec<_> = scanner
+            .scan()
+            .into_iter()
+            .filter(|s| s.port == port && (s.in_folder(selected_dir) || s.in_folder(other_dir)))
+            .collect();
+        // Only our own children may be stopped, even if a third party uses the same port.
+        scanner.known.retain(|&(pid, _), _| {
+            [selected.0.id(), other.0.id(), selected_v6.0.id()].contains(&pid)
+        });
+        let row = rows.iter().find(|row| row.in_folder(selected_dir)).unwrap();
+        scanner.stop(row);
+        for listener in [&selected, &selected_v6] {
+            assert_eq!(
+                unsafe { WaitForSingleObject(listener.0.as_raw_handle(), 5000) },
+                WAIT_OBJECT_0
+            );
+        }
+        assert_eq!(
+            unsafe { WaitForSingleObject(other.0.as_raw_handle(), STOP_WAIT_MS + 500) },
+            WAIT_TIMEOUT,
+            "stopping one folder also stopped its namesake"
+        );
+        assert_eq!(rows.len(), 2, "each folder should have one row");
+        assert_eq!(row.url(true), format!("http://127.0.0.1:{port}"));
     }
 
     #[test]
@@ -916,6 +1151,113 @@ mod tests {
                 super::listeners().contains(&(pid, socket.port(), socket.ip())),
                 "{address}"
             );
+        }
+    }
+
+    #[test]
+    fn starts_keep_descendants_alive_until_a_timeout() {
+        use std::{fs, path::PathBuf, time::SystemTime};
+        use windows_sys::Win32::System::Threading::{PROCESS_TERMINATE, TerminateProcess};
+
+        struct Fixture {
+            dir: PathBuf,
+            starting: Option<Starting>,
+            child: Option<Process>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(starting) = self.starting.take() {
+                    starting.end();
+                }
+                if let Some(child) = &self.child {
+                    unsafe {
+                        TerminateProcess(child.0, 1);
+                        WaitForSingleObject(child.0, 5000);
+                    }
+                }
+                for file in ["launcher.ps1", "ready", "exit"] {
+                    let _ = fs::remove_file(self.dir.join(file));
+                }
+                let _ = fs::remove_dir(&self.dir);
+            }
+        }
+
+        for timeout in [false, true] {
+            let unique = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = env::temp_dir().join(format!(
+                "portside start menü {} {unique}",
+                std::process::id()
+            ));
+            fs::create_dir(&dir).unwrap();
+            let mut fixture = Fixture {
+                dir,
+                starting: None,
+                child: None,
+            };
+            fs::write(fixture.dir.join("launcher.ps1"), r#"param([string]$Value)
+$info = [Diagnostics.ProcessStartInfo]::new("$PSHOME\powershell.exe")
+$info.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 60"'
+$info.UseShellExecute = $false
+$info.CreateNoWindow = $true
+$child = [Diagnostics.Process]::Start($info)
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'ready'), "$PID $($child.Id)`n$Value`n$($env:PATH.Split(';')[0])`n$PWD`n")
+while (!(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'exit'))) { Start-Sleep -Milliseconds 10 }
+"#).unwrap();
+            let launch = Launch {
+                dir: fixture.dir.to_str().unwrap().into(),
+                exe: env::var("SystemRoot").unwrap() + r"\System32\WindowsPowerShell\v1.0\powershell.exe",
+                args: r#"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "launcher.ps1" "two words""#.into(),
+                nested: false,
+            };
+            fixture.starting = Some(start(&launch, 8001).expect("fixture must start"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let ready = loop {
+                if let Ok(text) = fs::read_to_string(fixture.dir.join("ready"))
+                    && text.ends_with('\n')
+                {
+                    break text;
+                }
+                assert!(Instant::now() < deadline, "launcher must report its child");
+                thread::sleep(Duration::from_millis(10));
+            };
+            let mut lines = ready.lines();
+            let mut pids = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap());
+            let parent = Process::open(pids.next().unwrap(), PROCESS_SYNCHRONIZE).unwrap();
+            fixture.child = Some(
+                Process::open(
+                    pids.next().unwrap(),
+                    PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                )
+                .unwrap(),
+            );
+            assert_eq!(lines.next(), Some("two words"));
+            assert_eq!(
+                lines.next(),
+                fixture.dir.join(r"node_modules\.bin").to_str()
+            );
+            assert_eq!(lines.next(), fixture.dir.to_str());
+            fs::write(fixture.dir.join("exit"), "").unwrap();
+            assert_eq!(
+                unsafe { WaitForSingleObject(parent.0, 5000) },
+                WAIT_OBJECT_0
+            );
+            let child = fixture.child.as_ref().unwrap();
+            assert_eq!(unsafe { WaitForSingleObject(child.0, 0) }, WAIT_TIMEOUT);
+            let starting = fixture.starting.take().unwrap();
+            if timeout {
+                starting.end();
+                assert_eq!(unsafe { WaitForSingleObject(child.0, 5000) }, WAIT_OBJECT_0);
+            } else {
+                drop(starting);
+                assert_eq!(unsafe { WaitForSingleObject(child.0, 200) }, WAIT_TIMEOUT);
+            }
         }
     }
 }

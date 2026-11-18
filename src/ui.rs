@@ -18,7 +18,7 @@ use std::{
 };
 use win_taskbar_host::{Content, Surface, TaskbarHost};
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
         Dwm::{
             DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
@@ -29,6 +29,7 @@ use windows_sys::Win32::{
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
+        Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         Controls::WM_MOUSELEAVE,
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
@@ -49,8 +50,9 @@ const POLL: usize = 1;
 const SHOW: usize = 2;
 const SPIN: usize = 3;
 const POLL_MS: u32 = 1000;
-/// Posted to the menu when a mouse button goes down anywhere.
+/// Posted for a click outside the menu and its native popup.
 const BUTTON_DOWN: u32 = WM_APP;
+const FOREGROUND_CHANGED: u32 = WM_APP + 1;
 
 const STRIP_TEXT: Style = Style(font::STRIP_SIZE, Face::Regular, 0);
 const MENU_TEXT: Style = Style(font::MENU_SIZE, Face::Regular, 0);
@@ -113,8 +115,6 @@ struct Layout {
     /// Where the name starts, and the width it gets before it is cut.
     name_x: f32,
     name_max: f32,
-    /// The label's width with the widest server, so the menu keeps one width while cycling.
-    label_max_w: f32,
 }
 
 struct State {
@@ -131,10 +131,14 @@ struct State {
     layout: Layout,
     view: HWND,
     menu: HWND,
+    /// The visible rows, shared by painting, sizing and pointer hit tests.
+    menu_rows: Vec<Row>,
     menu_w: f32,
     mode: Mode,
     /// The mouse hook, while the toggle view is open.
     hook: HHOOK,
+    /// Recheck an open menu on the server poll if the foreground hook is unavailable.
+    poll_menu_order: bool,
     dpi: u32,
     hover: Option<Part>,
     pressed: Option<Part>,
@@ -149,7 +153,7 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-    /// The menu, for the mouse hook, which can run while `STATE` is borrowed.
+    /// The menu, for hooks that can run while `STATE` is borrowed.
     static PANEL: Cell<HWND> = const { Cell::new(null_mut()) };
 }
 
@@ -190,6 +194,17 @@ pub fn run() -> Result<(), String> {
         SetTimer(menu, POLL, POLL_MS, None);
     }
     PANEL.set(menu);
+    let foreground_hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
     STATE.set(Some(State {
         renderer,
         scanner: Scanner::default(),
@@ -202,9 +217,11 @@ pub fn run() -> Result<(), String> {
         layout: Layout::default(),
         view: null_mut(),
         menu,
+        menu_rows: Vec::new(),
         menu_w: 0.0,
         mode: Mode::Normal,
         hook: null_mut(),
+        poll_menu_order: foreground_hook.is_null(),
         dpi: 96,
         hover: None,
         pressed: None,
@@ -247,7 +264,12 @@ pub fn run() -> Result<(), String> {
             drop(with(|state| state.host.take()));
             result
         });
-    unsafe { DestroyWindow(menu) };
+    unsafe {
+        if !foreground_hook.is_null() {
+            UnhookWinEvent(foreground_hook);
+        }
+        DestroyWindow(menu);
+    }
     STATE.take();
     result
 }
@@ -366,25 +388,18 @@ impl State {
                 name_x +=
                     self.renderer.measure(&format!("{n}/{n}"), COUNT_TEXT) + strip::COUNT_TO_NAME;
             }
-            // A server's name width limit and the label's right edge when it shows.
-            let fit = |server: &Server| {
-                let port_w = self
-                    .renderer
-                    .measure(&format!(":{}", server.port), STRIP_TEXT);
-                let name_max = strip::NAME_SLOT_W - strip::NAME_TO_PORT - port_w;
-                let name_w = self
-                    .renderer
-                    .measure(&server.name, STRIP_TEXT)
-                    .min(name_max);
-                let right = name_x + name_w + strip::NAME_TO_PORT + port_w + strip::LABEL_PAD_X;
-                (name_max, right)
-            };
-            let (name_max, right) = fit(server);
-            let widest = self.servers.iter().map(|s| fit(s).1).fold(0.0, f32::max);
+            let port_w = self
+                .renderer
+                .measure(&format!(":{}", server.port), STRIP_TEXT);
+            let name_max = strip::NAME_SLOT_W - strip::NAME_TO_PORT - port_w;
+            let name_w = self
+                .renderer
+                .measure(&server.name, STRIP_TEXT)
+                .min(name_max);
+            let right = name_x + name_w + strip::NAME_TO_PORT + port_w + strip::LABEL_PAD_X;
             layout.label = [strip::LEAD, LABEL_TOP, right, LABEL_TOP + strip::HIT_H];
             layout.name_x = name_x;
             layout.name_max = name_max;
-            layout.label_max_w = widest - strip::LEAD;
         } else if self.projects.split() > 0 {
             let right = GLOBE[2] + strip::LABEL_PAD_X;
             layout.label = [strip::LEAD, LABEL_TOP, right, LABEL_TOP + strip::HIT_H];
@@ -408,33 +423,50 @@ impl State {
 
     /// Polls the listener table and finishes the starts that now listen.
     fn refresh(&mut self) {
+        if self.poll_menu_order && self.menu_open() {
+            unsafe {
+                let mut rect = RECT::default();
+                if GetWindowRect(self.menu, &mut rect) != 0 {
+                    let edge = POINT {
+                        x: rect.left + (rect.right - rect.left) / 2,
+                        y: rect.bottom - 1,
+                    };
+                    let foreground = GetForegroundWindow();
+                    if GetAncestor(WindowFromPoint(edge), GA_ROOT) == foreground {
+                        raise_for_taskbar(self.menu, self.view, foreground);
+                    }
+                }
+            }
+        }
         let servers = self.scanner.scan();
         let starting = self.starting.len();
         let mut started = Vec::new();
         for start in take(&mut self.starting) {
-            match servers.iter().find(|s| s.runs(&start.launch, start.port)) {
-                Some(server) => started.push(server.clone()), // the handle closes, the server runs on
+            match start.launch.find_server(&servers, start.port) {
+                Some(index) => started.push(index), // the handle closes, the server runs on
                 None if start.expired() => start.end(),
                 None => self.starting.push(start),
             }
         }
-        if let Some(last) = started.last() {
-            self.chosen = Some(last.clone());
+        if let Some(&last) = started.last() {
+            self.chosen = Some(servers[last].clone());
         }
         if servers != self.servers {
             self.apply(servers);
         } else if self.starting.len() != starting {
             self.rehover();
         }
-        for server in &started {
-            self.open(server);
+        for index in started {
+            self.open(&self.servers[index]);
         }
         // Keep menu geometry still while a click or drag is in progress.
         if self.pressed.is_none() && self.drag.is_none() {
+            // observe keeps a project for every readable running folder, too.
             let dirs = self
-                .servers
+                .projects
+                .list()
                 .iter()
-                .filter_map(|server| server.launch.as_ref().map(|launch| launch.dir.clone()))
+                .map(|p| p.launch.dir.clone())
                 .collect();
             if self.branches.refresh(dirs) {
                 if self.menu_open() {
@@ -449,13 +481,8 @@ impl State {
 
     /// Takes in a new scan and repaints.
     fn apply(&mut self, servers: Vec<Server>) {
-        // Keep the selection if a server changes its address within the same family.
         let index = |target: Option<&Server>| {
-            target.and_then(|t| {
-                servers.iter().position(|s| {
-                    (s.port, &s.name, s.address.is_ipv6()) == (t.port, &t.name, t.address.is_ipv6())
-                })
-            })
+            target.and_then(|target| servers.iter().position(|s| s.same_endpoint(target)))
         };
         let kept = index(self.chosen.as_ref()).or_else(|| index(self.servers.get(self.current)));
         self.current = kept.unwrap_or(self.current.min(servers.len().saturating_sub(1)));
@@ -527,7 +554,6 @@ impl State {
         let toggle = self.mode == Mode::Toggle;
         let part = self
             .slots()
-            .into_iter()
             .find(|&(_, rect)| contains(rect, at))
             .and_then(|(row, rect)| {
                 let zone = match row {
@@ -641,8 +667,7 @@ impl State {
                 zone @ (Zone::Action | Zone::Clear),
             ) => {
                 if zone == Zone::Action {
-                    let default = !self.projects.list()[p].default;
-                    self.projects.set_default(p, default, server, &self.servers);
+                    self.projects.toggle_default(p, server, &self.servers);
                 } else if self.can_clear(Some(p)) {
                     self.projects.remove_past(p);
                 }
@@ -725,36 +750,33 @@ impl State {
     }
 
     fn show_menu(&mut self) {
-        let items = self
-            .rows(Mode::Normal)
-            .iter()
-            .filter(|row| matches!(row, Row::Item { .. }))
-            .count();
-        if (self.mode == Mode::Normal
-            && items <= usize::from(!self.servers.is_empty())
-            && self.branch(self.current).is_none())
-            || self.view.is_null()
-        {
+        let rows = self.rows();
+        let can_open = match rows.as_slice() {
+            [] => false,
+            [
+                Row::Item {
+                    server: Some(i), ..
+                },
+            ] => self.servers[*i]
+                .launch
+                .as_ref()
+                .is_some_and(|launch| self.branches.get(&launch.dir).is_some()),
+            _ => true,
+        };
+        if self.view.is_null() || !can_open {
             return self.hide_menu();
         }
-        let widest = |mode| {
-            self.rows(mode)
-                .into_iter()
-                .map(|row| self.row_width(mode, row))
-                .fold(0.0, f32::max)
-        };
+        let widest = rows
+            .iter()
+            .map(|&row| self.row_width(row))
+            .fold(0.0, f32::max);
+        self.menu_rows = rows;
         let inset = menu::BORDER + menu::PAD;
-        // Both views' rows, so switching between them keeps one width. At least
-        // as wide as the label with any server, so the pointer can move
-        // straight up into it and cycling never resizes it.
-        let width = (widest(Mode::Normal).max(widest(Mode::Toggle))
-            + 2.0 * (menu::ROW_PAD_X + inset))
-            .max(menu::MIN_W)
-            .max(self.layout.label_max_w);
+        let width = widest + 2.0 * (menu::ROW_PAD_X + inset);
         let scale = self.scale();
         let w = (width * scale).ceil() as i32;
         self.menu_w = w as f32 / scale;
-        let height = self.slots().last().map_or(0.0, |&(_, rect)| rect[3]) + inset;
+        let height = self.slots().last().map_or(0.0, |(_, rect)| rect[3]) + inset;
         let h = (height * scale).ceil() as i32;
         unsafe {
             let mut view: RECT = zeroed();
@@ -774,13 +796,14 @@ impl State {
             }
         }
         // The label keeps its highlight while the menu is open.
-        self.redraw();
+        self.invalidate(self.view);
     }
 
     /// Closes the normal menu. The toggle view closes through `close_toggle`.
     fn hide_menu(&mut self) {
         if self.mode == Mode::Normal && self.menu_open() {
             unsafe { ShowWindow(self.menu, SW_HIDE) };
+            self.menu_rows.clear();
             if matches!(self.hover, Some(Part::Row(..))) {
                 self.set_hover(None);
             }
@@ -809,15 +832,10 @@ impl State {
         self.hide_menu();
     }
 
-    /// A mouse button went down somewhere. Clicking outside closes the toggle
-    /// view, but its right-click menu and the right-click that opens it don't.
-    fn button_down(&mut self, button: u32) {
-        let (under, _) = self.pointer(self.view);
-        let mut class = [0u16; 8];
-        let length = unsafe { GetClassNameW(under, class.as_mut_ptr(), class.len() as i32) };
-        let popup = String::from_utf16_lossy(&class[..length as usize]) == POPUP_MENU_CLASS;
-        let right_on_strip = button == WM_RBUTTONDOWN && under == self.view;
-        if self.mode == Mode::Toggle && under != self.menu && !popup && !right_on_strip {
+    /// The hook already excluded the panel and its popup menu.
+    fn button_down(&mut self, button: u32, target: HWND) {
+        let right_on_strip = button == WM_RBUTTONDOWN && target == self.view;
+        if self.mode == Mode::Toggle && !right_on_strip {
             self.close_toggle();
         }
     }
@@ -830,18 +848,18 @@ impl State {
         let split = self.projects.split();
         let to = self
             .slots()
-            .iter()
-            .rev()
-            .find_map(|&(row, rect)| match row {
+            .filter_map(|(row, rect)| match row {
                 Row::Item {
                     project: Some(p), ..
                 } if p < split && rect[1] <= y => Some(p),
                 _ => None,
             })
+            .last()
             .unwrap_or(0);
         if to != from {
             self.projects.reorder(from, to);
             self.drag = Some(to);
+            self.menu_rows = self.rows();
             self.invalidate(self.menu);
         }
     }
@@ -866,7 +884,9 @@ impl State {
 
     fn is_starting(&self, project: usize) -> bool {
         let dir = &self.projects.list()[project].launch.dir;
-        self.starting.iter().any(|start| start.launch.dir == *dir)
+        self.starting
+            .iter()
+            .any(|start| start.launch.dir.eq_ignore_ascii_case(dir))
     }
 
     fn can_clear(&self, project: Option<usize>) -> bool {
@@ -877,106 +897,102 @@ impl State {
     }
 
     /// What a view lists, top to bottom, with a line between groups that have rows.
-    fn rows(&self, mode: Mode) -> Vec<Row> {
+    fn rows(&self) -> Vec<Row> {
         let list = self.projects.list();
         let split = self.projects.split();
-        let defaults = (0..split).map(|p| Row::Item {
-            server: list[p].server,
-            project: Some(p),
-        });
-        // The servers no default owns, each with its folder's saved record.
-        let running = (0..self.servers.len())
-            .filter(|&i| !list[..split].iter().any(|p| p.server == Some(i)))
-            .map(|i| Row::Item {
-                server: Some(i),
-                project: (split..list.len())
-                    .find(|&p| self.servers[i].in_folder(&list[p].launch.dir)),
-            });
-        let groups: [Vec<Row>; 3] = match mode {
-            Mode::Normal => [running.collect(), defaults.collect(), Vec::new()],
-            Mode::Toggle => {
-                let past = (split..list.len())
-                    .filter(|&p| list[p].server.is_none())
-                    .map(|p| Row::Item {
+        let toggle = self.mode == Mode::Toggle;
+        let mut rows = Vec::new();
+        if toggle {
+            for (p, project) in list.iter().enumerate().skip(split) {
+                if project.server.is_none() {
+                    rows.push(Row::Item {
                         server: None,
                         project: Some(p),
                     });
-                let running = running.filter(|row| {
-                    matches!(
-                        row,
-                        Row::Item {
-                            project: Some(_),
-                            ..
-                        }
-                    )
-                });
-                [
-                    past.chain(running).collect(),
-                    defaults.collect(),
-                    vec![Row::Close],
-                ]
+                }
             }
-        };
-        groups
-            .into_iter()
-            .filter(|group| !group.is_empty())
-            .collect::<Vec<_>>()
-            .join(&Row::Line)
+        }
+        // The servers no default owns, each with its folder's saved record.
+        for (i, server) in self.servers.iter().enumerate() {
+            if list[..split].iter().any(|p| p.server == Some(i)) {
+                continue;
+            }
+            let project = (split..list.len()).find(|&p| server.in_folder(&list[p].launch.dir));
+            if !toggle || project.is_some() {
+                rows.push(Row::Item {
+                    server: Some(i),
+                    project,
+                });
+            }
+        }
+        if split > 0 && !rows.is_empty() {
+            rows.push(Row::Line);
+        }
+        rows.extend(
+            list[..split]
+                .iter()
+                .enumerate()
+                .map(|(p, project)| Row::Item {
+                    server: project.server,
+                    project: Some(p),
+                }),
+        );
+        if toggle {
+            if !rows.is_empty() {
+                rows.push(Row::Line);
+            }
+            rows.push(Row::Close);
+        }
+        rows
     }
 
     /// The open view's rows and where each one is.
-    fn slots(&self) -> Vec<(Row, Rect)> {
+    fn slots(&self) -> impl Iterator<Item = (Row, Rect)> + '_ {
         let inset = menu::BORDER + menu::PAD;
         let mut top = inset;
-        self.rows(self.mode)
-            .into_iter()
-            .map(|row| {
-                let height = match row {
-                    Row::Line => 2.0 * menu::LINE_MARGIN + menu::LINE_H,
-                    Row::Close | Row::Item { .. } => menu::ROW_H,
-                };
-                let rect = [inset, top, self.menu_w - inset, top + height];
-                top += height + menu::ROW_GAP;
-                (row, rect)
-            })
-            .collect()
-    }
-
-    fn branch(&self, server: usize) -> Option<&str> {
-        let launch = self.servers.get(server)?.launch.as_ref()?;
-        self.branches.get(&launch.dir)
+        self.menu_rows.iter().map(move |&row| {
+            let height = match row {
+                Row::Line => 2.0 * menu::LINE_MARGIN + menu::LINE_H,
+                Row::Close | Row::Item { .. } => menu::ROW_H,
+            };
+            let rect = [inset, top, self.menu_w - inset, top + height];
+            top += height + menu::ROW_GAP;
+            (row, rect)
+        })
     }
 
     /// An item's name, branch, port and text style.
     fn item(&self, server: Option<usize>, project: Option<usize>) -> (&str, String, String, Style) {
         let saved = project.map(|p| &self.projects.list()[p]);
-        let (name, port) = match (server.map(|i| &self.servers[i]), saved) {
-            (Some(running), _) => (running.name.as_str(), running.port),
-            (None, Some(saved)) => (saved.launch.name(), saved.port),
-            (None, None) => ("", 0),
+        let (name, port, launch) = match (server.map(|i| &self.servers[i]), saved) {
+            (Some(running), _) => (running.name.as_str(), running.port, running.launch.as_ref()),
+            (None, Some(saved)) => (saved.launch.name(), saved.port, Some(&saved.launch)),
+            (None, None) => ("", 0, None),
         };
         let style = if self.is_default(project) {
             MENU_TEXT
         } else {
             MENU_ITALIC
         };
-        let branch = server
-            .and_then(|i| self.branch(i))
+        let branch = launch
+            .and_then(|launch| self.branches.get(&launch.dir))
             .map_or_else(String::new, |branch| format!(" · {branch}"));
         (name, branch, format!(":{port}"), style)
     }
 
-    /// An item's content width in `mode`. Other rows fit in any panel.
-    fn row_width(&self, mode: Mode, row: Row) -> f32 {
-        let Row::Item { server, project } = row else {
-            return 0.0;
+    /// A row's full content width in the current view, before side padding.
+    fn row_width(&self, row: Row) -> f32 {
+        let (server, project) = match row {
+            Row::Item { server, project } => (server, project),
+            Row::Close => return self.renderer.measure("Close defaults", MENU_TEXT),
+            Row::Line => return 0.0,
         };
         let (name, branch, port, style) = self.item(server, project);
         let mut width = self.renderer.measure(name, style)
-            + menu::NAME_TO_PORT_MIN
             + self.renderer.measure(&branch, MENU_ITALIC)
+            + menu::NAME_TO_PORT_MIN
             + self.renderer.measure(&port, style);
-        if mode == Mode::Toggle {
+        if self.mode == Mode::Toggle {
             width += 2.0 * (font::ACTION_SIZE + menu::ICON_TO_TEXT);
         }
         width
@@ -1123,16 +1139,12 @@ impl State {
                 r.text(font::CLEAR, ACTION_ICON, icon, Align::Center, accent);
             }
         }
-        let mut branch_rect = text;
-        branch_rect[0] += r.measure(name, style);
         r.text(name, style, text, Align::Leading, ink);
-        r.text(
-            &branch,
-            MENU_ITALIC,
-            branch_rect,
-            Align::Leading,
-            color::TEXT,
-        );
+        if !branch.is_empty() {
+            let mut branch_rect = text;
+            branch_rect[0] += r.measure(name, style);
+            r.text(&branch, MENU_ITALIC, branch_rect, Align::Leading, ink);
+        }
         r.text(&port, style, text, Align::Trailing, ink);
         if server.is_none() && project.is_some_and(|p| self.is_starting(p)) {
             let right = text[2] - r.measure(&port, style) - menu::ICON_TO_TEXT;
@@ -1174,6 +1186,36 @@ fn track_leave(hwnd: HWND) {
     unsafe { TrackMouseEvent(&mut track) };
 }
 
+unsafe extern "system" fn foreground_changed(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    let menu = PANEL.get();
+    unsafe {
+        if IsWindowVisible(menu) != 0 {
+            // Explorer finishes activating the taskbar before we restore the menu's order.
+            PostMessageW(menu, FOREGROUND_CHANGED, 0, 0);
+        }
+    }
+}
+
+fn raise_for_taskbar(menu: HWND, view: HWND, foreground: HWND) {
+    unsafe {
+        if !foreground.is_null()
+            && foreground == GetAncestor(view, GA_ROOT)
+            && IsWindowVisible(menu) != 0
+        {
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            SetWindowPos(menu, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
+    }
+}
+
 /// Installed only while the toggle view is open: the panel never takes focus,
 /// so nothing else tells it about a click outside.
 unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1183,7 +1225,23 @@ unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
         );
         if code >= 0 && down {
-            PostMessageW(PANEL.get(), BUTTON_DOWN, w, 0);
+            // Capture the actual click before the pointer moves or the host's
+            // popup menu closes. The posted message can be handled later.
+            let target = WindowFromPoint((*(l as *const MSLLHOOKSTRUCT)).pt);
+            let panel = PANEL.get();
+            if target != panel {
+                let mut class = [0u16; 8];
+                let length = GetClassNameW(target, class.as_mut_ptr(), class.len() as i32);
+                let popup = class[..length as usize]
+                    .iter()
+                    .copied()
+                    .eq(POPUP_MENU_CLASS.encode_utf16())
+                    && GetWindowThreadProcessId(target, null_mut())
+                        == GetWindowThreadProcessId(panel, null_mut());
+                if !popup {
+                    PostMessageW(panel, BUTTON_DOWN, w, target as LPARAM);
+                }
+            }
         }
         CallNextHookEx(null_mut(), code, w, l)
     }
@@ -1251,7 +1309,12 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             WM_LBUTTONUP => _ = with(State::release),
             WM_MBUTTONUP => _ = with(State::stop),
             WM_CAPTURECHANGED => _ = with(State::end_drag),
-            BUTTON_DOWN => _ = with(|state| state.button_down(w as u32)),
+            BUTTON_DOWN => _ = with(|state| state.button_down(w as u32, l as HWND)),
+            FOREGROUND_CHANGED => {
+                if let Some(view) = with(|state| state.view) {
+                    raise_for_taskbar(hwnd, view, GetForegroundWindow());
+                }
+            }
             // Right-click anywhere opens the host's menu, which the strip forwards.
             WM_CONTEXTMENU => {
                 if let Some(view) = with(|state| state.view).filter(|view| !view.is_null()) {

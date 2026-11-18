@@ -1,4 +1,4 @@
-//! Current branches for running project folders, read off the UI thread.
+//! Current checkout labels for project folders, read off the UI thread.
 
 use std::{
     env,
@@ -14,7 +14,10 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::System::{Pipes::PeekNamedPipe, Threading::CREATE_NO_WINDOW};
+use windows_sys::Win32::{
+    Foundation::{ERROR_BROKEN_PIPE, GetLastError},
+    System::{Pipes::PeekNamedPipe, Threading::CREATE_NO_WINDOW},
+};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
@@ -65,15 +68,15 @@ impl Branches {
 
     /// Takes completed reads and requests another batch without waiting.
     pub fn refresh(&mut self, mut dirs: Vec<String>) -> bool {
-        dirs.sort_unstable_by_key(|dir| dir.to_ascii_lowercase());
+        dirs.sort_by_cached_key(|dir| dir.to_ascii_lowercase());
         dirs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-        let running = |dir: &str| dirs.iter().any(|d| d.eq_ignore_ascii_case(dir));
+        let tracked = |dir: &str| dirs.iter().any(|d| d.eq_ignore_ascii_case(dir));
         let before = self.entries.len();
-        self.entries.retain(|(dir, _)| running(dir));
+        self.entries.retain(|(dir, _)| tracked(dir));
         let mut changed = before != self.entries.len();
         if let Ok(mut entries) = self.results.try_recv() {
             self.pending = false;
-            entries.retain(|(dir, _)| running(dir));
+            entries.retain(|(dir, _)| tracked(dir));
             changed |= entries != self.entries;
             self.entries = entries;
         }
@@ -105,10 +108,43 @@ impl Drop for Branches {
 }
 
 fn read(dir: &str, stop: &AtomicBool) -> Option<String> {
+    let deadline = Instant::now() + TIMEOUT;
+    let run = |args: &[&str]| {
+        let (status, bytes) = output(git(dir).args(args), stop, deadline)?;
+        Some((status, String::from_utf8(bytes).ok()?))
+    };
+    let (status, text) = run(&["symbolic-ref", "--quiet", "HEAD"])?;
+    if status.success() {
+        let branch = text
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("refs/heads/")?;
+        return (!branch.is_empty()).then(|| branch.to_owned());
+    }
+    if status.code() != Some(1) {
+        return None;
+    }
+    let (status, text) = run(&[
+        "for-each-ref",
+        "--points-at=HEAD",
+        "--count=2",
+        "--format=%(refname:strip=2)",
+        "refs/heads/",
+    ])?;
+    if !status.success() {
+        return None;
+    }
+    let mut names = text.lines();
+    Some(match (names.next(), names.next()) {
+        (Some(name), None) if !name.is_empty() => name.to_owned(),
+        _ => "detached".to_owned(),
+    })
+}
+
+fn git(dir: &str) -> Command {
     let mut command = Command::new("git");
-    command.args(["-C", dir, "symbolic-ref", "--quiet", "HEAD"]);
+    command.args(["-C", dir]);
     // An agent or terminal may have selected a different repository through
-    // its environment. The server's folder is the sole source here.
+    // its environment. The project's folder is the sole source here.
     for (key, _) in env::vars_os() {
         if key
             .to_string_lossy()
@@ -118,17 +154,17 @@ fn read(dir: &str, stop: &AtomicBool) -> Option<String> {
             command.env_remove(key);
         }
     }
-    let text = String::from_utf8(output(&mut command, stop)?).ok()?;
-    let branch = text
-        .trim_end_matches(['\r', '\n'])
-        .strip_prefix("refs/heads/")?;
-    (!branch.is_empty()).then(|| branch.to_owned())
+    command
 }
 
 /// Drains available pipe bytes while checking both deadline and cancellation.
 /// Waiting for exit before reading can deadlock if stdout fills the pipe.
-fn output(command: &mut Command, stop: &AtomicBool) -> Option<Vec<u8>> {
-    if stop.load(Ordering::Relaxed) {
+fn output(
+    command: &mut Command,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Option<(ExitStatus, Vec<u8>)> {
+    if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
         return None;
     }
     let mut child = command
@@ -139,15 +175,17 @@ fn output(command: &mut Command, stop: &AtomicBool) -> Option<Vec<u8>> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take().expect("stdout was piped");
-    let started = Instant::now();
     let mut bytes = Vec::new();
-    let mut exited: Option<ExitStatus> = None;
     let result = loop {
-        if stop.load(Ordering::Relaxed) || started.elapsed() >= TIMEOUT {
+        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
             break None;
         }
+        // Check exit before the pipe so the final read includes all output.
+        let Ok(status) = child.try_wait() else {
+            break None;
+        };
         let mut available = 0;
-        unsafe {
+        let peeked = unsafe {
             PeekNamedPipe(
                 stdout.as_raw_handle(),
                 null_mut(),
@@ -155,7 +193,10 @@ fn output(command: &mut Command, stop: &AtomicBool) -> Option<Vec<u8>> {
                 null_mut(),
                 &mut available,
                 null_mut(),
-            );
+            )
+        };
+        if peeked == 0 && unsafe { GetLastError() } != ERROR_BROKEN_PIPE {
+            break None;
         }
         if available > 0 {
             let mut buffer = [0; 4096];
@@ -166,22 +207,16 @@ fn output(command: &mut Command, stop: &AtomicBool) -> Option<Vec<u8>> {
                 break None;
             }
             bytes.extend_from_slice(&buffer[..length]);
-        } else if let Some(status) = exited {
-            break status.success().then_some(bytes);
+        } else if let Some(status) = status {
+            break Some((status, bytes));
         } else {
-            match child.try_wait() {
-                Ok(status) => exited = status,
-                Err(_) => break None,
-            }
-            if exited.is_none() {
-                thread::sleep(POLL);
-            }
+            thread::sleep(POLL);
         }
     };
     if result.is_none() {
         let _ = child.kill();
+        let _ = child.wait();
     }
-    let _ = child.wait();
     result
 }
 
@@ -211,9 +246,9 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&self.0)
+            let output = git(&self.dir())
+                .env("GIT_CONFIG_GLOBAL", "NUL")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args([
                     "-c",
                     "user.name=Portside Test",
@@ -263,9 +298,34 @@ mod tests {
         );
         assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("main"));
         repo.git(&["switch", "--detach"]);
-        assert_eq!(read(&repo.dir(), &stop), None);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("detached"));
         assert_eq!(read(repo.0.join("missing").to_str().unwrap(), &stop), None);
         assert_eq!(read(env::temp_dir().to_str().unwrap(), &stop), None);
+    }
+
+    #[test]
+    fn names_detached_checkouts_only_for_one_exact_local_branch() {
+        let repo = Repo::new();
+        let stop = AtomicBool::new(false);
+        repo.git(&["commit", "--allow-empty", "-m", "initial"]);
+        repo.git(&["commit", "--allow-empty", "-m", "newer"]);
+        repo.git(&["switch", "--detach", "HEAD~1"]);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("detached"));
+
+        repo.git(&["update-ref", "refs/remotes/origin/design-work", "HEAD"]);
+        repo.git(&["tag", "saved-version"]);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("detached"));
+
+        repo.git(&["branch", "feature/menü"]);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("feature/menü"));
+        repo.git(&["branch", "another"]);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("detached"));
+        repo.git(&["branch", "-D", "another"]);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("feature/menü"));
+
+        // Moving the matching branch changes the label without moving HEAD.
+        repo.git(&["branch", "-f", "feature/menü", "main"]);
+        assert_eq!(read(&repo.dir(), &stop).as_deref(), Some("detached"));
     }
 
     #[test]
@@ -273,17 +333,23 @@ mod tests {
         let repo = Repo::new();
         let mut branches = Branches::new();
         let dirs = vec![repo.dir(), repo.dir().to_ascii_uppercase()];
-        let wait = |branches: &mut Branches, expected: &str| {
+        let wait = |branches: &mut Branches, expected: Option<&str>| {
             let started = Instant::now();
-            while branches.get(&repo.dir()) != Some(expected) {
+            while branches.get(&repo.dir()) != expected {
                 branches.refresh(dirs.clone());
                 assert!(started.elapsed() < Duration::from_secs(10));
                 thread::sleep(POLL);
             }
         };
-        wait(&mut branches, "main");
+        wait(&mut branches, Some("main"));
         repo.git(&["symbolic-ref", "HEAD", "refs/heads/feature/menu"]);
-        wait(&mut branches, "feature/menu");
+        wait(&mut branches, Some("feature/menu"));
+        let head = repo.0.join(".git/HEAD");
+        let backup = repo.0.join(".git/HEAD.before");
+        fs::rename(&head, &backup).unwrap();
+        wait(&mut branches, None);
+        fs::rename(&backup, &head).unwrap();
+        wait(&mut branches, Some("feature/menu"));
         assert!(branches.refresh(Vec::new()));
         assert_eq!(branches.get(&repo.dir()), None);
         // A result already in flight must not restore a removed folder.
@@ -296,14 +362,19 @@ mod tests {
 
     #[test]
     fn bounds_output_and_cancels_slow_commands() {
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Console]::Write('x' * 70000)",
-        ]);
-        assert!(output(&mut command, &AtomicBool::new(false)).is_none());
+        for length in [MAX_OUTPUT, MAX_OUTPUT + 1] {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg(format!("[Console]::Write('x' * {length})"));
+            let bytes = output(
+                &mut command,
+                &AtomicBool::new(false),
+                Instant::now() + TIMEOUT,
+            )
+            .map(|(_, bytes)| bytes.len());
+            assert_eq!(bytes, (length == MAX_OUTPUT).then_some(MAX_OUTPUT));
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&stop);
@@ -315,7 +386,7 @@ mod tests {
                 "-Command",
                 "Start-Sleep -Seconds 10",
             ]);
-            output(&mut command, &cancel)
+            output(&mut command, &cancel, Instant::now() + TIMEOUT)
         });
         thread::sleep(Duration::from_millis(100));
         stop.store(true, Ordering::Relaxed);
@@ -331,7 +402,7 @@ mod tests {
             "Start-Sleep -Seconds 10",
         ]);
         let started = Instant::now();
-        assert!(output(&mut command, &AtomicBool::new(false)).is_none());
+        assert!(output(&mut command, &AtomicBool::new(false), started + TIMEOUT).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

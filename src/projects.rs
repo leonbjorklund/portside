@@ -21,29 +21,30 @@ pub struct Project {
 }
 
 /// Defaults always come first.
+#[derive(Default)]
 pub struct Projects {
     list: Vec<Project>,
-    /// None when the file couldn't be read, so it is never overwritten.
-    path: Option<PathBuf>,
+    /// Last saved contents. An unreadable file is left alone.
+    file: Option<(PathBuf, String)>,
 }
 
 impl Projects {
     pub fn load() -> Self {
-        let path =
-            env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(r"Portside\projects.tsv"));
-        match path.as_ref().map(fs::read_to_string) {
-            Some(Ok(text)) => Self {
-                list: text.lines().filter_map(parse).collect(),
-                path,
-            },
-            Some(Err(error)) if error.kind() == ErrorKind::NotFound => Self {
-                list: Vec::new(),
-                path,
-            },
-            _ => Self {
-                list: Vec::new(),
-                path: None,
-            },
+        let Some(dir) = env::var_os("APPDATA") else {
+            return Self::default();
+        };
+        let path = PathBuf::from(dir).join(r"Portside\projects.tsv");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+            Err(_) => return Self::default(),
+        };
+        let mut list: Vec<_> = text.lines().filter_map(parse).collect();
+        // Keep each group's order even if the file interleaves defaults and past runs.
+        list.sort_by_key(|project| !project.default);
+        Self {
+            list,
+            file: Some((path, text)),
         }
     }
 
@@ -58,6 +59,7 @@ impl Projects {
 
     /// Records new projects and matches every project to a server from `servers`.
     pub fn observe(&mut self, servers: &[Server]) {
+        let split = self.split();
         for server in servers {
             let Some(launch) = &server.launch else {
                 continue;
@@ -69,7 +71,7 @@ impl Projects {
                     launch: launch.clone(),
                     server: None,
                 };
-                self.list.insert(self.split(), project);
+                self.list.insert(split, project);
             }
         }
         for i in 0..self.list.len() {
@@ -79,15 +81,14 @@ impl Projects {
                 launch,
                 server,
             } = &mut self.list[i];
-            let found = servers
-                .iter()
-                .position(|s| s.in_folder(&launch.dir) && s.port == *port)
-                .or_else(|| {
-                    servers.iter().position(|s| match *default {
-                        true => s.runs(launch, *port),
-                        false => s.in_folder(&launch.dir),
-                    })
-                });
+            let found = if *default {
+                launch.find_server(servers, *port)
+            } else {
+                servers
+                    .iter()
+                    .position(|s| s.in_folder(&launch.dir) && s.port == *port)
+                    .or_else(|| servers.iter().position(|s| s.in_folder(&launch.dir)))
+            };
             if let Some(index) = found {
                 *port = servers[index].port;
                 // A default keeps its command, so `astro preview` on its port
@@ -97,8 +98,7 @@ impl Projects {
                 }
                 *server = found;
             } else if server.take().is_some() && !*default {
-                let slot = self.split();
-                self.list[slot..=i].rotate_right(1);
+                self.list[split..=i].rotate_right(1);
             }
         }
         let mut stopped = 0;
@@ -112,22 +112,14 @@ impl Projects {
 
     /// Moves a project to the end of the defaults or the front of the past
     /// runs. A new default takes the port and command of the row's `server`.
-    pub fn set_default(
-        &mut self,
-        i: usize,
-        default: bool,
-        server: Option<usize>,
-        servers: &[Server],
-    ) {
+    pub fn toggle_default(&mut self, i: usize, server: Option<usize>, servers: &[Server]) {
         let mut project = self.list.remove(i);
-        project.default = default;
-        if let Some(Server {
-            port,
-            launch: Some(launch),
-            ..
-        }) = server.filter(|_| default).map(|index| &servers[index])
+        project.default = !project.default;
+        if project.default
+            && let Some(index) = server
+            && let Some(launch) = &servers[index].launch
         {
-            project.port = *port;
+            project.port = servers[index].port;
             project.launch.clone_from(launch);
         }
         self.list.insert(self.split(), project);
@@ -151,21 +143,26 @@ impl Projects {
 
     /// Writes a temporary file and renames it over the list, so a crash never
     /// leaves a partial file.
-    pub fn save(&self) {
-        let Some(path) = &self.path else {
+    pub fn save(&mut self) {
+        let Some((path, saved)) = &mut self.file else {
             return;
         };
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
         let text: String = self.list.iter().map(line).collect();
+        if text == *saved {
+            return;
+        }
+        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
         let result = (|| {
             fs::create_dir_all(path.parent().unwrap_or(path))?;
             let mut file = fs::File::create(&temp)?;
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temp, path)
+            fs::rename(&temp, path.as_path())
         })();
-        if result.is_err() {
+        if result.is_ok() {
+            *saved = text;
+        } else {
             let _ = fs::remove_file(temp);
         }
     }
@@ -227,6 +224,7 @@ mod tests {
 
     fn server(port: u16, launch: Launch) -> Server {
         Server {
+            pid: 0,
             port,
             name: launch.name().into(),
             address: Ipv4Addr::LOCALHOST.into(),
@@ -245,7 +243,7 @@ mod tests {
                     server: None,
                 })
                 .collect(),
-            path: None,
+            file: None,
         }
     }
 
@@ -268,6 +266,25 @@ mod tests {
     }
 
     #[test]
+    fn a_server_restarting_on_its_saved_port_leaves_the_file_alone() {
+        let path = env::temp_dir().join(format!("portside-projects-{}.tsv", std::process::id()));
+        let saved = launch(r"C:\site\", "dev");
+        let mut projects = projects([(true, 3000, saved.clone())]);
+        let text = line(&projects.list()[0]);
+        let mut file = fs::File::create_new(&path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        drop(file);
+
+        projects.file = Some((path.clone(), text));
+        projects.observe(&[server(3000, saved)]);
+        projects.observe(&[]);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn a_default_binds_only_its_port_or_its_own_command() {
         let dir = r"C:\site\";
         let saved = launch(dir, "saved");
@@ -283,6 +300,14 @@ mod tests {
                 3001,
             ),
             (vec![server(3002, saved.clone())], Some(0), 3002),
+            (
+                vec![
+                    server(3001, launch(r"C:\other\", "saved")),
+                    server(3002, saved.clone()),
+                ],
+                Some(1),
+                3002,
+            ),
             (vec![server(3002, other.clone())], None, 3001),
             (vec![server(3002, sibling.clone())], None, 3001),
             (vec![server(3001, other.clone())], Some(0), 3001),
@@ -376,10 +401,10 @@ mod tests {
             server(5, launch(dir, "low")),
             server(6, launch(dir, "clicked")),
         ];
-        projects.set_default(3, true, Some(1), &running);
+        projects.toggle_default(3, Some(1), &running);
         assert_eq!(ports(&projects), [1, 2, 6, 3]);
         assert_eq!(projects.list()[2].launch.args, "clicked");
-        projects.set_default(0, false, None, &running);
+        projects.toggle_default(0, None, &running);
         assert_eq!(ports(&projects), [2, 6, 1, 3]);
     }
 }

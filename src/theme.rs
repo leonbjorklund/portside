@@ -49,7 +49,7 @@ pub mod color {
     pub const MENU: Rgb = 0x2b2b2b;
     /// The menu's border and the line between its groups.
     pub const MENU_BORDER: Rgb = 0x3a3a3a;
-    /// The name and port of a project that isn't running.
+    /// The name, branch and port of a project that isn't running.
     pub const STOPPED: Rgb = 0x949494;
 
     /// The globe while no servers are running.
@@ -83,7 +83,6 @@ pub mod strip {
 /// into it directly.
 pub mod menu {
     pub const SHOW_DELAY_MS: u32 = 350;
-    pub const MIN_W: f32 = 215.0;
     pub const PAD: f32 = 3.0;
     pub const BORDER: f32 = 1.0;
     /// DWMWCP_ROUND, which also gives the system shadow.
@@ -93,7 +92,8 @@ pub mod menu {
     pub const ROW_PAD_X: f32 = 6.0;
     pub const ROW_GAP: f32 = 1.0;
     pub const ROW_RADIUS: f32 = 4.0;
-    pub const NAME_TO_PORT_MIN: f32 = 16.0;
+    /// 44 screen pixels at 150% Windows scale, including the spinner slot.
+    pub const NAME_TO_PORT_MIN: f32 = 44.0 / 1.5;
 
     /// The line between groups, and each bar of the drag handle.
     pub const LINE_H: f32 = 1.0;
@@ -105,8 +105,8 @@ pub mod menu {
     pub const HANDLE_BARS: [f32; 2] = [2.0, 5.0];
     /// Left icon to name, port to action, and spinner to port.
     pub const ICON_TO_TEXT: f32 = 5.0;
-    /// With `ICON_TO_TEXT` this is `NAME_TO_PORT_MIN`, so nothing moves when
-    /// a spinner appears.
+    /// Fits with `ICON_TO_TEXT` inside `NAME_TO_PORT_MIN`, so nothing moves
+    /// when a spinner appears.
     pub const SPINNER: f32 = 11.0;
     pub const SPINNER_RADIUS: f32 = 4.1;
     pub const SPINNER_STROKE: f32 = 1.15;

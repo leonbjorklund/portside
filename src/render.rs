@@ -5,7 +5,6 @@ use crate::{
 };
 use std::{
     ffi::c_void,
-    mem::zeroed,
     ptr::{NonNull, null, null_mut},
 };
 use windows_sys::Win32::{
@@ -113,6 +112,9 @@ impl Renderer {
     }
 
     pub fn measure(&self, text: &str, style: Style) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
         let text: Vec<u16> = text.encode_utf16().collect();
         unsafe { portside_measure(self.0.as_ptr(), text.as_ptr(), text.len() as u32, &style) }
     }
@@ -127,14 +129,13 @@ impl Renderer {
         scene: impl Fn(),
     ) -> bool {
         for _ in 0..2 {
-            let begun = unsafe {
+            let mut result = unsafe {
                 portside_begin(self.0.as_ptr(), dc, size.0, size.1, dpi as f32, background)
             };
-            if begun < 0 {
-                return false;
+            if result >= 0 {
+                scene();
+                result = unsafe { portside_end(self.0.as_ptr()) };
             }
-            scene();
-            let result = unsafe { portside_end(self.0.as_ptr()) };
             if result != D2DERR_RECREATE_TARGET {
                 return result >= 0;
             }
@@ -151,8 +152,11 @@ impl Renderer {
         background: Rgb,
         scene: impl Fn(),
     ) -> bool {
-        let size = (rect.right - rect.left, rect.bottom - rect.top);
-        if size.0 <= 0 || size.1 <= 0 {
+        let size = SIZE {
+            cx: rect.right - rect.left,
+            cy: rect.bottom - rect.top,
+        };
+        if size.cx <= 0 || size.cy <= 0 {
             return false;
         }
         unsafe {
@@ -163,14 +167,14 @@ impl Renderer {
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: size.0,
-                    biHeight: -size.1,
+                    biWidth: size.cx,
+                    biHeight: -size.cy,
                     biPlanes: 1,
                     biBitCount: 32,
                     biCompression: BI_RGB,
-                    ..zeroed()
+                    ..Default::default()
                 },
-                ..zeroed()
+                ..Default::default()
             };
             let mut bits = null_mut();
             let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
@@ -184,14 +188,10 @@ impl Renderer {
                 DeleteDC(dc);
                 return false;
             }
-            let drawn = self.paint(dc, size, dpi, background, scene);
+            let drawn = self.paint(dc, (size.cx, size.cy), dpi, background, scene);
             let position = POINT {
                 x: rect.left,
                 y: rect.top,
-            };
-            let size = SIZE {
-                cx: size.0,
-                cy: size.1,
             };
             let origin = POINT { x: 0, y: 0 };
             let updated = drawn
@@ -220,6 +220,9 @@ impl Renderer {
 
     /// Only inside `paint`. Centered vertically in `rect`, cut with "…" past its width.
     pub fn text(&self, text: &str, style: Style, rect: Rect, align: Align, color: Rgb) {
+        if text.is_empty() {
+            return;
+        }
         let text: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             portside_text(
