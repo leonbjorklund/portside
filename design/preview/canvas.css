@@ -1,0 +1,83 @@
+@font-face {
+  font-family: 'Portside Atkinson';
+  src: url('../../assets/fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Regular.ttf') format('truetype');
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: 'Portside Atkinson';
+  src: url('../../assets/fonts/atkinsonhyperlegible/AtkinsonHyperlegible-Italic.ttf') format('truetype');
+  font-style: italic;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: 'Portside Fluent';
+  src: local('Segoe Fluent Icons');
+}
+
+:root {
+  color-scheme: dark;
+  font: 14px/1.45 'Segoe UI', sans-serif;
+  background: #121416;
+  color: #f1f3f4;
+}
+
+body { margin: 0; }
+main { max-width: 920px; margin: 0 auto; padding: clamp(28px, 10vh, 90px) clamp(12px, 4vw, 44px); }
+.heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+h1 { margin: 0; font: 400 clamp(22px, 4vw, 30px)/1.15 'Portside Atkinson', sans-serif; }
+
+.heading button, .controls button, .controls select {
+  border: 1px solid #45494f;
+  border-radius: 5px;
+  background: #282c31;
+  color: #e8eaec;
+  font: inherit;
+  cursor: pointer;
+}
+
+.heading button { background: transparent; padding: 5px 11px; }
+.heading button:hover, .controls select:hover { background: #32363b; }
+.heading button:focus-visible, .controls :focus-visible { outline: 2px solid #9fc4ef; outline-offset: 2px; }
+.workbench { border: 1px solid #353a40; border-radius: 11px; overflow: hidden; }
+.controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 18px; padding: 12px 16px; background: #202328; border-bottom: 1px solid #34383e; }
+.controls label { display: inline-flex; gap: 7px; align-items: center; font-size: 13px; color: #bcc2c8; }
+.controls select { height: 30px; padding-inline: 7px 3px; }
+.views { display: inline-flex; margin-right: auto; border: 1px solid #464b51; border-radius: 6px; background: #1a1d21; padding: 2px; }
+.views button { border: 0; background: transparent; color: #bcc2c8; padding: 4px 10px; font-size: 13px; }
+.views button:hover { color: #fff; }
+.views button[aria-pressed='true'] { background: #3c4249; color: #fff; }
+
+.viewport { display: grid; grid-template-columns: minmax(max-content, 1fr); overflow-x: auto; }
+#desktop {
+  --anchor-x: 40px;
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  grid-template-rows: minmax(140px, 1fr) 32px;
+  min-height: 218px;
+  padding-top: 20px;
+  box-sizing: border-box;
+  background: #171b20;
+}
+
+#panel-shelf {
+  position: relative;
+  top: 6px;
+  z-index: 1;
+  align-self: end;
+  justify-self: start;
+  margin-inline: calc(var(--anchor-x) + 6px) 20px;
+}
+
+.taskbar { box-sizing: border-box; background: #1c1c1c; box-shadow: inset 0 1px #333; padding: 4px 0 0 var(--anchor-x); }
+#strip-host { width: max-content; }
+.feedback { min-height: 1.45em; margin: 12px 2px 0; font-size: 13px; color: #b5bbc2; }
+
+@media (max-width: 570px) {
+  .controls { padding: 10px; gap: 8px 12px; }
+  .views { margin-right: 0; }
+  #desktop { --anchor-x: 12px; }
+}

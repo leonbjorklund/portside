@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Portside layout canvas</title>
+  <link rel="icon" href="../../assets/portside.ico">
+  <link rel="stylesheet" href="canvas.css">
+  <link rel="stylesheet" href="strip.css">
+  <link rel="stylesheet" href="menu.css">
+  <script defer src="strip.js"></script>
+  <script defer src="menu.js"></script>
+  <script defer src="canvas.js"></script>
+</head>
+<body>
+  <main>
+    <header class="heading">
+      <h1>Portside layout canvas</h1>
+      <button id="reset" type="button">Reset example</button>
+    </header>
+
+    <div class="workbench">
+      <div class="controls" aria-label="Canvas controls" role="group">
+        <div class="views" role="group" aria-label="Portside view">
+          <button type="button" data-view="strip" aria-pressed="false">Taskbar</button>
+          <button type="button" data-view="servers" aria-pressed="true">Server menu</button>
+          <button type="button" data-view="defaults" aria-pressed="false">Defaults</button>
+        </div>
+        <label>Example
+          <select id="example">
+            <option value="snapshot">Current snapshot</option>
+            <option value="mixed">Mixed projects</option>
+            <option value="single">One server without Git</option>
+            <option value="stopped">Stopped defaults</option>
+            <option value="empty">No projects</option>
+          </select>
+        </label>
+        <label>Zoom
+          <select id="zoom">
+            <option value="1">100%</option>
+            <option value="1.5">150%</option>
+            <option value="2">200%</option>
+          </select>
+        </label>
+      </div>
+      <section class="viewport" aria-label="Portside taskbar preview">
+        <div id="desktop">
+          <div id="panel-shelf"></div>
+          <div class="taskbar"><div id="strip-host"></div></div>
+        </div>
+      </section>
+    </div>
+    <p class="feedback" role="status" id="feedback"></p>
+  </main>
+  <template id="vscode-button">
+    <button class="ps-menu-editor" type="button">
+      <!-- The monochrome silhouette from VS Code's own code-icon.svg. -->
+      <svg width="12" height="12" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true" focusable="false">
+        <path fill-rule="evenodd" d="M181.534 254.252a15.934 15.934 0 0 0 12.7-.488l52.706-25.361a16.002 16.002 0 0 0 9.06-14.42V42.018c0-6.15-3.522-11.754-9.06-14.42L194.234 2.238a15.939 15.939 0 0 0-18.185 3.097l-100.9 92.052-43.95-33.361a10.655 10.655 0 0 0-13.614.605L3.49 77.453c-4.648 4.227-4.653 11.54-.011 15.774L41.593 128 3.478 162.773c-4.642 4.235-4.637 11.547.011 15.775l14.097 12.822a10.655 10.655 0 0 0 13.613.606l43.95-33.362 100.9 92.053a15.915 15.915 0 0 0 5.485 3.585Zm10.505-184.367L115.479 128l76.56 58.115V69.885Z"/>
+      </svg>
+    </button>
+  </template>
+</body>
+</html>

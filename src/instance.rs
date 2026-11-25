@@ -1,7 +1,10 @@
 use crate::wide;
 use std::{
     env,
-    os::windows::process::CommandExt,
+    os::windows::{
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     path::Path,
     process::{Child, Command},
     ptr, thread,
@@ -9,8 +12,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
-        WAIT_OBJECT_0,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM,
+        WAIT_OBJECT_0, WPARAM,
     },
     System::{
         JobObjects::{
@@ -18,37 +21,126 @@ use windows_sys::Win32::{
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             QueryInformationJobObject,
         },
+        SystemInformation::GetTickCount64,
         Threading::{
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateMutexW, GetCurrentProcess,
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-            QueryFullProcessImageNameW, WaitForSingleObject,
+            OpenMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            QueryFullProcessImageNameW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
         },
     },
-    UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
+    UI::{
+        Input::KeyboardAndMouse::{GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, VK_RETURN},
+        WindowsAndMessaging::{
+            AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_APP,
+            WM_CLOSE,
+        },
+    },
 };
 
-pub struct Instance(HANDLE);
-impl Instance {
-    pub fn acquire() -> Result<Option<Self>, String> {
-        // Freed only after GetLastError, which freeing could reset.
-        let name = wide("Portside");
-        unsafe {
-            let handle = CreateMutexW(ptr::null(), 0, name.as_ptr());
-            if handle.is_null() {
-                return Err("Could not create Portside's single-instance lock.".into());
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SHOW_MENU: u32 = WM_APP + 2;
+
+/// The Start shortcut's request, valid until the user moves on or startup times out.
+#[derive(Clone, Copy)]
+pub struct MenuRequest {
+    requested_at: u64,
+    last_input: u32,
+}
+
+impl MenuRequest {
+    pub fn capture() -> Option<Self> {
+        let mut request = Self {
+            requested_at: unsafe { GetTickCount64() },
+            last_input: last_input_time()?,
+        };
+        // Start can launch on Enter down. Its release belongs to that same action.
+        let enter_down = || unsafe { GetAsyncKeyState(i32::from(VK_RETURN)) < 0 };
+        if enter_down() {
+            loop {
+                thread::sleep(Duration::from_millis(10));
+                if !enter_down() {
+                    request.last_input = last_input_time()?;
+                    break;
+                }
+                if !request.is_fresh() || setup_running() {
+                    return None;
+                }
             }
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                CloseHandle(handle);
-                Ok(None)
-            } else {
-                Ok(Some(Self(handle)))
+        }
+        Some(request)
+    }
+
+    pub fn from_message(time: WPARAM, input: LPARAM) -> Self {
+        Self {
+            requested_at: time as u64,
+            last_input: input as u32,
+        }
+    }
+
+    pub fn is_fresh(self) -> bool {
+        let age = unsafe { GetTickCount64() }.wrapping_sub(self.requested_at);
+        age < STARTUP_TIMEOUT.as_millis() as u64 && last_input_time() == Some(self.last_input)
+    }
+
+    /// Another copy owns the mutex. It can still be creating its menu window.
+    pub fn forward(self) {
+        let (hwnd, pid) = loop {
+            if !self.is_fresh() || setup_running() {
+                return;
+            }
+            if let Some(owner) = running() {
+                break owner;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        if let Ok(_owner) = owner_process(hwnd, pid, 0)
+            && self.is_fresh()
+            && unsafe { AllowSetForegroundWindow(pid) } != 0
+        {
+            unsafe {
+                PostMessageW(
+                    hwnd,
+                    SHOW_MENU,
+                    self.requested_at as WPARAM,
+                    self.last_input as LPARAM,
+                );
             }
         }
     }
 }
-impl Drop for Instance {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
+
+fn last_input_time() -> Option<u32> {
+    let mut input = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    (unsafe { GetLastInputInfo(&mut input) } != 0).then_some(input.dwTime)
+}
+
+/// Inno controls the installed executable while either of these mutexes exists.
+pub fn setup_running() -> bool {
+    ["PortsideSetup", "PortsideUninstall"].iter().any(|name| {
+        let name = wide(name);
+        unsafe {
+            let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+            if handle.is_null() {
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            CloseHandle(handle);
+            true
+        }
+    })
+}
+
+pub fn acquire() -> Result<Option<OwnedHandle>, String> {
+    let name = wide("Portside");
+    unsafe {
+        let handle = CreateMutexW(ptr::null(), 0, name.as_ptr());
+        if handle.is_null() {
+            return Err("Could not create Portside's single-instance lock.".into());
+        }
+        let new = GetLastError() != ERROR_ALREADY_EXISTS;
+        Ok(new.then_some(OwnedHandle::from_raw_handle(handle)))
     }
 }
 
@@ -60,20 +152,47 @@ fn running() -> Option<(HWND, u32)> {
             return None;
         }
         let mut pid = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        Some((hwnd, pid))
+        (GetWindowThreadProcessId(hwnd, &mut pid) != 0).then_some((hwnd, pid))
+    }
+}
+
+/// Hold the process and recheck its window before granting focus or posting a close.
+fn owner_process(hwnd: HWND, pid: u32, access: u32) -> Result<OwnedHandle, String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | access, 0, pid) };
+    if process.is_null() {
+        return Err("Could not track the running Portside's shutdown.".into());
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut image = [0u16; 32768];
+    let mut length = image.len() as u32;
+    let named = unsafe {
+        QueryFullProcessImageNameW(process.as_raw_handle(), 0, image.as_mut_ptr(), &mut length)
+    };
+    if named != 0
+        && Path::new(&String::from_utf16_lossy(&image[..length as usize]))
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("portside.exe"))
+        && running() == Some((hwnd, pid))
+    {
+        Ok(process)
+    } else {
+        Err("Could not identify the running Portside.".into())
     }
 }
 
 pub fn close_existing() -> Result<(), String> {
     // The installer can retain the lock briefly after its launcher exits.
     // A starting Portside also owns it before creating its window.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let (hwnd, pid) = loop {
-        if let Some(owner) = running() {
-            break owner;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let (hwnd, pid, process) = loop {
+        if let Some((hwnd, pid)) = running() {
+            match owner_process(hwnd, pid, PROCESS_SYNCHRONIZE) {
+                Ok(process) => break (hwnd, pid, process),
+                Err(error) if running() == Some((hwnd, pid)) => return Err(error),
+                Err(_) => {} // The owner exited while its process was being checked.
+            }
         }
-        if Instance::acquire()?.is_some() {
+        if acquire()?.is_some() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -82,35 +201,12 @@ pub fn close_existing() -> Result<(), String> {
         thread::sleep(Duration::from_millis(50));
     };
     unsafe {
-        let process = OpenProcess(
-            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            pid,
-        );
-        if process.is_null() {
-            return Err("Could not track the running Portside's shutdown.".into());
-        }
-        // A window class alone is not proof that the process is Portside.
-        let mut image = [0u16; 32768];
-        let mut length = image.len() as u32;
-        let identified = QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut length)
-            != 0
-            && Path::new(&String::from_utf16_lossy(&image[..length as usize]))
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("portside.exe"));
-        if !identified {
-            CloseHandle(process);
-            return Err("Could not identify the running Portside.".into());
-        }
-        if PostMessageW(hwnd, WM_CLOSE, 0, 0) == 0 {
-            CloseHandle(process);
+        if PostMessageW(hwnd, WM_CLOSE, 0, 0) == 0 && running() == Some((hwnd, pid)) {
             return Err("Could not ask the running Portside to exit.".into());
         }
         // The window disappears before the mutex is released. Wait for the
         // exact owner process, including same-path reinstalls.
-        let exited = WaitForSingleObject(process, 5000) == WAIT_OBJECT_0;
-        CloseHandle(process);
-        if !exited {
+        if WaitForSingleObject(process.as_raw_handle(), 5000) != WAIT_OBJECT_0 {
             return Err("The running Portside did not exit. Close it and try again.".into());
         }
     }
@@ -170,7 +266,7 @@ fn job_kills_on_close() -> bool {
 }
 
 fn verify_started(child: &mut Child) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut window_since = None;
     loop {
         if child

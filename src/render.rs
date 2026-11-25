@@ -5,15 +5,16 @@ use crate::{
 };
 use std::{
     ffi::c_void,
-    ptr::{NonNull, null, null_mut},
+    ptr::{NonNull, null_mut},
 };
 use windows_sys::Win32::{
     Foundation::{D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE},
     Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, HDC, SelectObject,
+        AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+        CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HDC,
+        SelectObject,
     },
-    UI::WindowsAndMessaging::{ULW_OPAQUE, UpdateLayeredWindow},
+    UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow},
 };
 
 unsafe extern "C" {
@@ -40,9 +41,17 @@ unsafe extern "C" {
         width: i32,
         height: i32,
         dpi: f32,
-        background: Rgb,
+        background: Option<&Rgb>,
     ) -> i32;
     fn portside_fill(renderer: *mut c_void, rect: *const Rect, radius: f32, color: Rgb, alpha: f32);
+    fn portside_outline(
+        renderer: *mut c_void,
+        rect: *const Rect,
+        radius: f32,
+        stroke: f32,
+        color: Rgb,
+    );
+    fn portside_vscode_ribbon(renderer: *mut c_void, x: f32, y: f32, size: f32, color: Rgb);
     fn portside_text(
         renderer: *mut c_void,
         text: *const u16,
@@ -119,19 +128,19 @@ impl Renderer {
         unsafe { portside_measure(self.0.as_ptr(), text.as_ptr(), text.len() as u32, &style) }
     }
 
-    /// Clears to `background` and draws `scene`, once more after a lost device.
+    /// Clears to `background` or transparency and draws again after a lost device.
     pub fn paint(
         &self,
         dc: HDC,
         size: (i32, i32),
         dpi: u32,
-        background: Rgb,
+        background: Option<Rgb>,
         scene: impl Fn(),
     ) -> bool {
+        let clear = background.as_ref();
         for _ in 0..2 {
-            let mut result = unsafe {
-                portside_begin(self.0.as_ptr(), dc, size.0, size.1, dpi as f32, background)
-            };
+            let mut result =
+                unsafe { portside_begin(self.0.as_ptr(), dc, size.0, size.1, dpi as f32, clear) };
             if result >= 0 {
                 scene();
                 result = unsafe { portside_end(self.0.as_ptr()) };
@@ -143,15 +152,8 @@ impl Renderer {
         false
     }
 
-    /// Draws an opaque layered window and publishes its pixels and screen rect together.
-    pub fn present(
-        &self,
-        hwnd: HWND,
-        rect: RECT,
-        dpi: u32,
-        background: Rgb,
-        scene: impl Fn(),
-    ) -> bool {
+    /// Publishes a layered window's premultiplied pixels and screen rect together.
+    pub fn present(&self, hwnd: HWND, rect: RECT, dpi: u32, scene: impl Fn()) -> bool {
         let size = SIZE {
             cx: rect.right - rect.left,
             cy: rect.bottom - rect.top,
@@ -188,12 +190,18 @@ impl Renderer {
                 DeleteDC(dc);
                 return false;
             }
-            let drawn = self.paint(dc, (size.cx, size.cy), dpi, background, scene);
+            let drawn = self.paint(dc, (size.cx, size.cy), dpi, None, scene);
             let position = POINT {
                 x: rect.left,
                 y: rect.top,
             };
             let origin = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
             let updated = drawn
                 && UpdateLayeredWindow(
                     hwnd,
@@ -203,8 +211,8 @@ impl Renderer {
                     dc,
                     &origin,
                     0,
-                    null(),
-                    ULW_OPAQUE,
+                    &blend,
+                    ULW_ALPHA,
                 ) != 0;
             SelectObject(dc, previous);
             DeleteObject(bitmap);
@@ -216,6 +224,15 @@ impl Renderer {
     /// Only inside `paint`.
     pub fn fill(&self, rect: Rect, radius: f32, color: Rgb, alpha: f32) {
         unsafe { portside_fill(self.0.as_ptr(), &rect, radius, color, alpha) }
+    }
+
+    /// Draws a rounded outline inside the given bounds.
+    pub fn outline(&self, rect: Rect, radius: f32, stroke: f32, color: Rgb) {
+        unsafe { portside_outline(self.0.as_ptr(), &rect, radius, stroke, color) }
+    }
+
+    pub fn vscode_ribbon(&self, x: f32, y: f32, size: f32, color: Rgb) {
+        unsafe { portside_vscode_ribbon(self.0.as_ptr(), x, y, size, color) }
     }
 
     /// Only inside `paint`. Centered vertically in `rect`, cut with "…" past its width.

@@ -3,6 +3,8 @@
 
 use crate::{
     branches::Branches,
+    editor, instance,
+    menu_controls::Controls,
     projects::Projects,
     render::{Align, Face, Rect, Renderer, Style},
     servers::{self, Scanner, Server, Starting},
@@ -11,21 +13,20 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     mem::{take, zeroed},
+    path::{Component, Path, PathBuf, Prefix},
     process::{Command, Stdio},
     ptr::{null, null_mut},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use win_taskbar_host::{Content, Surface, TaskbarHost};
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    Graphics::{
-        Dwm::{
-            DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
-        },
-        Gdi::{
-            BeginPaint, EndPaint, HDC, InvalidateRect, PAINTSTRUCT, ScreenToClient, ValidateRect,
-        },
+    Graphics::Gdi::{
+        BeginPaint, EndPaint, HDC, InvalidateRect, PAINTSTRUCT, ScreenToClient, ValidateRect,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -33,7 +34,8 @@ use windows_sys::Win32::{
         Controls::WM_MOUSELEAVE,
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
-            GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            GetCapture, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
+            TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
         },
         WindowsAndMessaging::*,
     },
@@ -47,12 +49,14 @@ const VIEW_CLASS: &str = "PortsideStrip";
 const POPUP_MENU_CLASS: &str = "#32768";
 /// Menu timers.
 const POLL: usize = 1;
-const SHOW: usize = 2;
+const HOVER: usize = 2;
 const SPIN: usize = 3;
 const POLL_MS: u32 = 1000;
 /// Posted for a click outside the menu and its native popup.
 const BUTTON_DOWN: u32 = WM_APP;
 const FOREGROUND_CHANGED: u32 = WM_APP + 1;
+const VIEW_READY: u32 = WM_APP + 3;
+const EDITOR_READY: u32 = WM_APP + 4;
 
 const STRIP_TEXT: Style = Style(font::STRIP_SIZE, Face::Regular, 0);
 const MENU_TEXT: Style = Style(font::MENU_SIZE, Face::Regular, 0);
@@ -81,10 +85,18 @@ enum Mode {
     Toggle,
 }
 
-/// The part of a toggle view row under the pointer. The Close row is all `Action`.
+#[derive(Clone, Copy, PartialEq)]
+enum MenuFocus {
+    Hover,
+    FindingFirst,
+    Keyboard,
+}
+
+/// The Close row is all `Action`.
 #[derive(Clone, Copy, PartialEq)]
 enum Zone {
     Body,
+    Editor,
     Action,
     Clear,
     Handle,
@@ -105,6 +117,57 @@ enum Row {
 enum Part {
     Label,
     Row(Row, Zone),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Input {
+    Left,
+    Middle,
+    Key(u16),
+}
+
+/// Control identity across scans. A saved default can start on a different port.
+#[derive(Clone, PartialEq)]
+enum RowKey {
+    Default(String),
+    Folder(String, u16),
+    Process(u32, u16),
+}
+
+#[derive(Default)]
+struct EditorAvailability {
+    exe: Option<PathBuf>,
+    folders: HashMap<String, bool>,
+}
+
+enum EditorUpdate {
+    Installation(Option<PathBuf>),
+    Folder(String, bool),
+    Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum EditorSource {
+    Installation,
+    Drive(u8),
+    Share,
+}
+
+impl EditorSource {
+    fn folder(dir: &str) -> Self {
+        if let Some(Component::Prefix(prefix)) = Path::new(dir).components().next()
+            && let Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) = prefix.kind()
+        {
+            return Self::Drive(letter.to_ascii_uppercase());
+        }
+        // Standard and verbatim UNC paths share a worker, separate from every drive letter.
+        Self::Share
+    }
+}
+
+struct EditorScan {
+    result: Receiver<EditorUpdate>,
+    from_closed_menu: bool,
 }
 
 /// Strip geometry for the current server, kept for painting and hit tests.
@@ -141,7 +204,14 @@ struct State {
     poll_menu_order: bool,
     dpi: u32,
     hover: Option<Part>,
-    pressed: Option<Part>,
+    hover_deadline: Option<Instant>,
+    pressed: Option<(Part, Input)>,
+    focus: MenuFocus,
+    menu_request: Option<instance::MenuRequest>,
+    controls: Controls<(RowKey, Zone), Part>,
+    editor: EditorAvailability,
+    /// At most one worker per source across openings, even when a mapped drive or share stalls.
+    editor_scans: HashMap<EditorSource, EditorScan>,
     /// The project whose handle is being dragged.
     drag: Option<usize>,
     wheel: i32,
@@ -167,7 +237,7 @@ fn contains(rect: Rect, (x, y): (f32, f32)) -> bool {
     x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(request: Option<instance::MenuRequest>) -> Result<(), String> {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let renderer = Renderer::new()?;
     // Wide enough for every state with a server, so the strip never shifts
@@ -182,15 +252,6 @@ pub fn run() -> Result<(), String> {
     let ex_style = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED;
     let menu = window(CLASS_NAME, ex_style, WS_POPUP, null_mut(), (0, 0))?;
     unsafe {
-        // DWM rounds the corners and adds the shadow. Its border matches the
-        // one paint_menu draws, for systems where DWM keeps corners square.
-        let border = color::MENU_BORDER.swap_bytes() >> 8; // COLORREF is 0x00BBGGRR
-        for (attribute, value) in [
-            (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32),
-            (DWMWA_BORDER_COLOR, border),
-        ] {
-            DwmSetWindowAttribute(menu, attribute as u32, (&raw const value).cast(), 4);
-        }
         SetTimer(menu, POLL, POLL_MS, None);
     }
     PANEL.set(menu);
@@ -224,7 +285,13 @@ pub fn run() -> Result<(), String> {
         poll_menu_order: foreground_hook.is_null(),
         dpi: 96,
         hover: None,
+        hover_deadline: None,
         pressed: None,
+        focus: MenuFocus::Hover,
+        menu_request: request,
+        controls: Controls::default(),
+        editor: EditorAvailability::default(),
+        editor_scans: HashMap::new(),
         drag: None,
         wheel: 0,
         full_width,
@@ -233,6 +300,7 @@ pub fn run() -> Result<(), String> {
     with(|state| {
         let servers = state.scanner.scan();
         state.apply(servers);
+        state.try_menu_request();
     });
     let result = TaskbarHost::builder(full_width as f64)
         .height_dip(strip::HEIGHT as f64)
@@ -251,6 +319,8 @@ pub fn run() -> Result<(), String> {
             with(|state| {
                 state.view = view;
                 state.dpi = surface.dpi;
+                // The host positions and shows this child after the factory returns.
+                unsafe { PostMessageW(state.menu, VIEW_READY, 0, 0) };
             });
             Ok(View(view))
         })
@@ -454,6 +524,7 @@ impl State {
         if servers != self.servers {
             self.apply(servers);
         } else if self.starting.len() != starting {
+            self.sync_controls();
             self.rehover();
         }
         for index in started {
@@ -471,16 +542,26 @@ impl State {
             if self.branches.refresh(dirs) {
                 if self.menu_open() {
                     self.show_menu();
-                    self.rehover();
                 } else if self.hover == Some(Part::Label) {
-                    unsafe { SetTimer(self.menu, SHOW, menu::SHOW_DELAY_MS, None) };
+                    self.arm_hover(menu::SHOW_DELAY_MS);
                 }
             }
         }
+        if self.menu_open() && self.mode == Mode::Normal {
+            self.editor_ready();
+            if self.editor.exe.is_some() {
+                self.check_editor(true);
+            }
+        }
+        self.try_menu_request();
     }
 
     /// Takes in a new scan and repaints.
     fn apply(&mut self, servers: Vec<Server>) {
+        let held = self
+            .pressed
+            .take()
+            .and_then(|(part, input)| self.action_id(part).map(|id| (id, input)));
         let index = |target: Option<&Server>| {
             target.and_then(|target| servers.iter().position(|s| s.same_endpoint(target)))
         };
@@ -488,13 +569,21 @@ impl State {
         self.current = kept.unwrap_or(self.current.min(servers.len().saturating_sub(1)));
         self.servers = servers;
         self.projects.observe(&self.servers);
-        self.pressed = None;
         self.relayout();
         self.fit();
         if self.menu_open() {
             self.show_menu();
+        } else {
+            self.rehover();
         }
-        self.rehover();
+        // A scan can change row indices. Continue only if the same action is still targeted.
+        if let Some((id, input)) = held
+            && let Some(part) = self.target(input)
+            && self.enabled(part)
+            && self.action_id(part) == Some(id)
+        {
+            self.pressed = Some((part, input));
+        }
     }
 
     fn step(&mut self, by: isize) {
@@ -505,6 +594,9 @@ impl State {
     }
 
     fn choose(&mut self, i: usize) {
+        if self.current != i && self.pressed.is_some_and(|(part, _)| part == Part::Label) {
+            self.pressed = None;
+        }
         self.current = i;
         self.chosen = self.servers.get(i).cloned();
         self.relayout();
@@ -526,28 +618,30 @@ impl State {
         let changed = self.hover != part;
         if changed {
             self.hover = part;
-            self.pressed = None;
+            if !matches!(self.pressed, Some((_, Input::Key(_)))) {
+                self.pressed = None;
+            }
         }
         changed
     }
 
     fn strip_move(&mut self, at: (f32, f32)) {
         let part = contains(self.layout.label, at).then_some(Part::Label);
-        if !self.set_hover(part) {
-            return;
+        let changed = self.set_hover(part);
+        if part.is_none() {
+            self.outside_menu_and_label();
+        } else if self.menu_open() {
+            self.cancel_hover_timer();
+        } else if changed {
+            self.arm_hover(menu::SHOW_DELAY_MS);
         }
-        unsafe {
-            if part.is_none() {
-                KillTimer(self.menu, SHOW);
-                self.hide_menu();
-            } else if !self.menu_open() {
-                SetTimer(self.menu, SHOW, menu::SHOW_DELAY_MS, None);
-            }
+        if changed {
+            self.redraw();
         }
-        self.redraw();
     }
 
     fn menu_move(&mut self, at: (f32, f32)) {
+        self.cancel_hover_timer();
         if self.drag.is_some() {
             return self.drag_to(at.1);
         }
@@ -558,6 +652,9 @@ impl State {
             .and_then(|(row, rect)| {
                 let zone = match row {
                     Row::Close => Zone::Action,
+                    Row::Item { .. } if !toggle && contains(row_buttons(rect).1, at) => {
+                        Zone::Editor
+                    }
                     Row::Item { .. } if !toggle => Zone::Body,
                     Row::Item { .. } if at.0 >= rect[2] - menu::ROW_PAD_X - font::ACTION_SIZE => {
                         Zone::Action
@@ -583,13 +680,23 @@ impl State {
         }
     }
 
-    /// The window under the pointer, and the pointer in `client`'s DIPs.
-    fn pointer(&self, client: HWND) -> (HWND, (f32, f32)) {
+    /// Read the cursor once. Native buttons share the painted menu's coordinates.
+    fn pointer(&self) -> (HWND, (f32, f32)) {
         unsafe {
             let mut cursor = zeroed();
-            GetCursorPos(&mut cursor);
+            if GetCursorPos(&mut cursor) == 0 {
+                return (null_mut(), (0.0, 0.0));
+            }
             let under = WindowFromPoint(cursor);
-            ScreenToClient(client, &mut cursor);
+            let under = if IsChild(self.menu, under) != 0 {
+                self.menu
+            } else {
+                under
+            };
+            if under != self.view && under != self.menu {
+                return (under, (0.0, 0.0));
+            }
+            ScreenToClient(under, &mut cursor);
             let scale = self.scale();
             (under, (cursor.x as f32 / scale, cursor.y as f32 / scale))
         }
@@ -597,61 +704,140 @@ impl State {
 
     /// The rows or the strip may have changed under a still pointer.
     fn rehover(&mut self) {
-        let (under, at) = self.pointer(self.view);
+        let (under, at) = self.pointer();
         if under == self.menu {
-            self.menu_move(self.pointer(self.menu).1);
+            self.menu_move(at);
         } else if under == self.view {
             self.strip_move(at);
         } else {
+            self.outside_menu_and_label();
             self.set_hover(None);
         }
         self.redraw();
     }
 
-    /// The pointer left the strip or the menu. The menu stays open only while
-    /// the pointer is on it or on the label.
-    fn leave(&mut self, from_menu: bool) {
-        unsafe { KillTimer(self.menu, SHOW) };
-        self.wheel = 0;
-        if self
-            .hover
-            .is_some_and(|part| matches!(part, Part::Row(..)) == from_menu)
+    fn outside_menu_and_label(&mut self) {
+        if self.menu_open() && self.mode == Mode::Normal && self.focus == MenuFocus::Hover {
+            self.arm_hover(menu::HIDE_DELAY_MS);
+        } else {
+            self.cancel_hover_timer();
+        }
+    }
+
+    fn arm_hover(&mut self, delay: u32) {
+        if self.hover_deadline.is_none() && unsafe { SetTimer(self.menu, HOVER, delay, None) } != 0
         {
-            self.set_hover(None);
-            self.redraw();
-        }
-        let (under, at) = self.pointer(self.view);
-        if under != self.menu && !contains(self.layout.label, at) {
-            self.hide_menu();
+            self.hover_deadline = Some(Instant::now() + Duration::from_millis(delay.into()));
         }
     }
 
-    /// `left` is the left button, otherwise the middle one. Only what reacts
-    /// to that button is pressed, so `stop` can't act on a stale target.
-    fn press(&mut self, left: bool) {
-        self.pressed = match self.hover {
-            Some(Part::Row(_, Zone::Body)) if self.mode == Mode::Toggle => None,
-            Some(Part::Row(_, Zone::Action | Zone::Clear)) if !left => None,
-            Some(Part::Row(Row::Item { project, .. }, Zone::Handle)) => {
-                if left {
-                    self.drag = project;
-                    self.hover = None;
-                    unsafe { SetCapture(self.menu) };
-                }
-                None
-            }
-            hover => hover,
-        };
-        self.redraw();
+    fn cancel_hover_timer(&mut self) {
+        if self.hover_deadline.take().is_some() {
+            unsafe { KillTimer(self.menu, HOVER) };
+        }
     }
 
-    fn release(&mut self) {
-        if self.drag.is_some() {
-            return self.end_drag();
-        }
-        let Some(part) = self.pressed.take() else {
+    fn finish_hover(&mut self) {
+        let Some(deadline) = self.hover_deadline else {
             return;
         };
+        if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            // KillTimer can leave a message from the previous entry or exit in the queue.
+            unsafe { SetTimer(self.menu, HOVER, remaining.as_millis().max(1) as u32, None) };
+            return;
+        }
+        self.cancel_hover_timer();
+        let (under, at) = self.pointer();
+        let label = under == self.view && contains(self.layout.label, at);
+        if self.menu_open() {
+            if !label
+                && under != self.menu
+                && self.focus == MenuFocus::Hover
+                && self.mode == Mode::Normal
+            {
+                self.hide_menu();
+            }
+        } else if label {
+            self.show_menu();
+        }
+    }
+
+    fn leave(&mut self) {
+        self.wheel = 0;
+        self.rehover();
+    }
+
+    fn press(&mut self, button: Input) {
+        if self.focus == MenuFocus::FindingFirst {
+            self.focus = MenuFocus::Keyboard;
+        }
+        let target = self.hover.filter(|&part| {
+            self.enabled(part) && (button != Input::Middle || self.stop_target(part).is_some())
+        });
+        self.pressed = match target {
+            Some(Part::Row(Row::Item { project, .. }, Zone::Handle)) => {
+                self.drag = project;
+                self.hover = None;
+                unsafe { SetCapture(self.menu) };
+                None
+            }
+            hover => hover.map(|part| (part, button)),
+        };
+        self.redraw();
+    }
+
+    fn mouse_button(&mut self, window: HWND, message: u32, l: LPARAM) {
+        let at = self.point(l);
+        if window == self.menu {
+            self.menu_move(at);
+        } else {
+            self.strip_move(at);
+        }
+        match message {
+            WM_LBUTTONDOWN => self.press(Input::Left),
+            WM_MBUTTONDOWN => self.press(Input::Middle),
+            WM_LBUTTONUP => self.release(Input::Left),
+            WM_MBUTTONUP => self.release(Input::Middle),
+            _ => {}
+        }
+    }
+
+    fn target(&self, input: Input) -> Option<Part> {
+        match input {
+            Input::Key(_) => self.controls.focused(),
+            _ => self.hover,
+        }
+    }
+
+    fn release(&mut self, input: Input) {
+        if self.drag.is_some() && input == Input::Left {
+            return self.end_drag();
+        }
+        let Some((part, down)) = self.pressed else {
+            return;
+        };
+        if down != input {
+            return;
+        }
+        self.pressed = None;
+        if self.target(input) == Some(part) {
+            if input != Input::Middle {
+                return self.activate(part);
+            }
+            if let Some(i) = self.stop_target(part) {
+                self.scanner.stop(&self.servers[i]);
+            }
+        }
+        self.redraw();
+    }
+
+    fn activate(&mut self, part: Part) {
+        if self.focus == MenuFocus::FindingFirst {
+            self.focus = MenuFocus::Keyboard;
+        }
+        if !self.enabled(part) {
+            return;
+        }
         match part {
             Part::Label => {
                 if let Some(server) = self.servers.get(self.current) {
@@ -659,6 +845,15 @@ impl State {
                 }
             }
             Part::Row(Row::Close, _) => self.close_toggle(),
+            Part::Row(row, Zone::Editor) => {
+                if let Some(exe) = &self.editor.exe
+                    && let Some(dir) = self.row_dir(row)
+                {
+                    let exe = exe.clone();
+                    let dir = PathBuf::from(dir);
+                    thread::spawn(move || editor::open(&exe, &dir));
+                }
+            }
             Part::Row(
                 Row::Item {
                     server,
@@ -673,13 +868,12 @@ impl State {
                 }
                 self.relayout();
                 self.show_menu();
-                self.rehover();
             }
             Part::Row(
                 Row::Item {
                     server: Some(i), ..
                 },
-                _,
+                Zone::Body,
             ) => {
                 self.choose(i);
                 self.open(&self.servers[i]);
@@ -688,11 +882,12 @@ impl State {
                 Row::Item {
                     project: Some(p), ..
                 },
-                _,
-            ) if !self.is_starting(p) => {
+                Zone::Body,
+            ) => {
                 let saved = &self.projects.list()[p];
                 if let Some(start) = servers::start(&saved.launch, saved.port) {
                     self.starting.push(start);
+                    self.sync_controls();
                     unsafe { SetTimer(self.menu, SPIN, menu::SPINNER_FRAME_MS, None) };
                 }
             }
@@ -721,21 +916,13 @@ impl State {
             .spawn();
     }
 
-    /// Middle-click: stops the label's or the row's server. It leaves the
-    /// strip on the first poll after it exits.
-    fn stop(&mut self) {
-        let Some(part) = self.pressed.take() else {
-            return;
-        };
-        let i = match part {
-            Part::Label => Some(self.current),
-            Part::Row(Row::Item { server, .. }, _) => server,
+    /// A middle press belongs only to a running strip label or row body.
+    fn stop_target(&self, part: Part) -> Option<usize> {
+        match part {
+            Part::Label => self.servers.get(self.current).map(|_| self.current),
+            Part::Row(Row::Item { server, .. }, Zone::Body) if self.mode == Mode::Normal => server,
             Part::Row(..) => None,
-        };
-        if let Some(server) = i.and_then(|i| self.servers.get(i)) {
-            self.scanner.stop(server);
         }
-        self.redraw();
     }
 
     /// One spinner frame. The timer outlasts the last start by one tick, which
@@ -750,6 +937,7 @@ impl State {
     }
 
     fn show_menu(&mut self) {
+        let opening = !self.menu_open();
         let rows = self.rows();
         let can_open = match rows.as_slice() {
             [] => false,
@@ -764,7 +952,9 @@ impl State {
             _ => true,
         };
         if self.view.is_null() || !can_open {
-            return self.hide_menu();
+            self.hide_menu();
+            self.rehover();
+            return;
         }
         let widest = rows
             .iter()
@@ -778,9 +968,13 @@ impl State {
         self.menu_w = w as f32 / scale;
         let height = self.slots().last().map_or(0.0, |(_, rect)| rect[3]) + inset;
         let h = (height * scale).ceil() as i32;
-        unsafe {
+        if opening {
+            self.cancel_hover_timer();
+        }
+        self.sync_controls();
+        let presented = unsafe {
             let mut view: RECT = zeroed();
-            GetWindowRect(self.view, &mut view);
+            let located = GetWindowRect(self.view, &mut view) != 0;
             // Bottom edge on the top of the label's hover rect, left edges aligned.
             let left = view.left + (strip::LEAD * scale).round() as i32;
             let bottom = view.top + (LABEL_TOP * scale).ceil() as i32;
@@ -790,19 +984,352 @@ impl State {
                 right: left + w,
                 bottom,
             };
-            if self.present_menu(rect) {
-                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
-                SetWindowPos(self.menu, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            located
+                && self.present_menu(rect)
+                && SetWindowPos(self.menu, HWND_TOPMOST, 0, 0, 0, 0, flags) != 0
+        };
+        if !presented {
+            if self.mode == Mode::Toggle {
+                self.close_toggle();
+            } else {
+                self.hide_menu();
+            }
+        } else if opening && self.mode == Mode::Normal {
+            self.check_editor(true);
+        }
+        self.rehover();
+    }
+
+    fn try_menu_request(&mut self) {
+        let Some(request) = self.menu_request else {
+            return;
+        };
+        if !request.is_fresh() {
+            self.menu_request = None;
+            return;
+        }
+        if self.mode == Mode::Toggle {
+            self.close_toggle();
+        }
+        if let Some(dir) = self.single_server_dir()
+            && !self.branches.checked(dir)
+        {
+            let dir = dir.to_owned();
+            self.branches.prioritize(&dir);
+            return;
+        }
+        if self.view.is_null() || unsafe { IsWindowVisible(self.view) } == 0 {
+            return;
+        }
+        self.menu_request = None;
+        let was_open = self.menu_open();
+        self.show_menu();
+        if self.menu_open() {
+            if request.is_fresh() && unsafe { SetForegroundWindow(self.menu) } != 0 {
+                self.focus = MenuFocus::FindingFirst;
+                self.cancel_hover_timer();
+                self.pressed = None;
+                unsafe { SetFocus(self.menu) };
+                self.focus_first_available();
+            } else if !was_open {
+                self.hide_menu();
             }
         }
-        // The label keeps its highlight while the menu is open.
-        self.invalidate(self.view);
+    }
+
+    fn single_server_dir(&self) -> Option<&str> {
+        match self.rows().as_slice() {
+            [
+                row @ Row::Item {
+                    server: Some(_), ..
+                },
+            ] => self.row_dir(*row),
+            _ => None,
+        }
+    }
+
+    fn check_editor(&mut self, installation: bool) {
+        let mut groups = HashMap::<_, Vec<_>>::new();
+        if installation && !self.editor_scans.contains_key(&EditorSource::Installation) {
+            groups.insert(EditorSource::Installation, Vec::new());
+        }
+        if self.editor.exe.is_some() {
+            let mut seen = HashSet::new();
+            for dir in self.menu_rows.iter().filter_map(|&row| self.row_dir(row)) {
+                let source = EditorSource::folder(dir);
+                if !self.editor_scans.contains_key(&source) && seen.insert(dir) {
+                    groups
+                        .entry(source)
+                        .or_default()
+                        .push((dir.to_owned(), self.editor.folders.get(dir).copied()));
+                }
+            }
+        }
+        for (source, folders) in groups {
+            self.start_editor_scan(source, folders);
+        }
+    }
+
+    fn start_editor_scan(&mut self, source: EditorSource, folders: Vec<(String, Option<bool>)>) {
+        let (send, result) = mpsc::channel();
+        self.editor_scans.insert(
+            source,
+            EditorScan {
+                result,
+                from_closed_menu: false,
+            },
+        );
+        let menu = self.menu as usize;
+        let cached = self.editor.exe.clone();
+        thread::spawn(move || {
+            let publish = |update| {
+                if send.send(update).is_ok() {
+                    unsafe { PostMessageW(menu as HWND, EDITOR_READY, 0, 0) };
+                }
+            };
+            if source == EditorSource::Installation {
+                let exe = match cached {
+                    Some(path) => path.is_file().then_some(path),
+                    None => editor::discover(),
+                };
+                publish(EditorUpdate::Installation(exe));
+            } else {
+                for (dir, previous) in folders {
+                    let readable = editor::available(Path::new(&dir));
+                    if previous != Some(readable) {
+                        publish(EditorUpdate::Folder(dir, readable));
+                    }
+                }
+            }
+            publish(EditorUpdate::Done);
+        });
+    }
+
+    fn editor_ready(&mut self) {
+        let open = self.mode == Mode::Normal && self.menu_open();
+        let installed = self.editor.exe.is_some();
+        let mut changed = false;
+        let mut retry_installation = false;
+        let mut retry_folders = false;
+        self.editor_scans.retain(|&source, scan| {
+            loop {
+                match scan.result.try_recv() {
+                    Ok(EditorUpdate::Done) if !scan.from_closed_menu => return false,
+                    Ok(EditorUpdate::Done) | Err(mpsc::TryRecvError::Disconnected) => {
+                        if source == EditorSource::Installation {
+                            retry_installation = true;
+                        } else {
+                            retry_folders = true;
+                        }
+                        return false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return true,
+                    Ok(_) if !open || scan.from_closed_menu => {}
+                    Ok(EditorUpdate::Installation(exe)) => {
+                        changed |= self.editor.exe != exe;
+                        self.editor.exe = exe;
+                    }
+                    Ok(EditorUpdate::Folder(dir, readable)) => {
+                        changed |= self.editor.folders.insert(dir, readable) != Some(readable);
+                    }
+                }
+            }
+        });
+        if !open {
+            return;
+        }
+        if retry_installation || retry_folders || (!installed && self.editor.exe.is_some()) {
+            self.check_editor(retry_installation);
+        }
+        if changed {
+            self.sync_controls();
+            self.invalidate(self.menu);
+        } else {
+            self.focus_first_available();
+        }
+    }
+
+    fn enabled(&self, part: Part) -> bool {
+        match part {
+            Part::Row(Row::Item { server, project }, Zone::Body) => {
+                self.mode == Mode::Normal
+                    && (server.is_some() || project.is_some_and(|p| !self.is_starting(p)))
+            }
+            Part::Row(row, Zone::Editor) => {
+                self.editor.exe.is_some()
+                    && self
+                        .row_dir(row)
+                        .is_some_and(|dir| self.editor.folders.get(dir) == Some(&true))
+            }
+            _ => true,
+        }
+    }
+
+    fn row_dir(&self, row: Row) -> Option<&str> {
+        let Row::Item { server, project } = row else {
+            return None;
+        };
+        self.row_source(server, project)
+            .2
+            .map(|launch| launch.dir.as_str())
+    }
+
+    fn row_key(&self, server: Option<usize>, project: Option<usize>) -> RowKey {
+        if let Some(i) = server
+            && !self.is_default(project)
+        {
+            let running = &self.servers[i];
+            return match &running.launch {
+                Some(launch) => RowKey::Folder(launch.dir.to_ascii_lowercase(), running.port),
+                None => RowKey::Process(running.pid, running.port),
+            };
+        }
+        let saved = &self.projects.list()[project.expect("a default has a saved project")];
+        RowKey::Default(saved.launch.dir.to_ascii_lowercase())
+    }
+
+    /// Opening or stopping a replacement listener is a different action, even on the same port.
+    fn action_id(&self, part: Part) -> Option<(RowKey, Zone, Option<Server>)> {
+        let Part::Row(Row::Item { server, project }, zone) = part else {
+            return None;
+        };
+        (self.mode == Mode::Normal).then(|| {
+            let endpoint = server
+                .filter(|_| zone == Zone::Body)
+                .map(|i| self.servers[i].clone());
+            (self.row_key(server, project), zone, endpoint)
+        })
+    }
+
+    /// The native controls follow the painted actions in visual order.
+    fn sync_controls(&mut self) {
+        if self.mode != Mode::Normal || self.menu_rows.is_empty() {
+            self.controls.clear();
+            return;
+        }
+        if self.pressed.is_some_and(|(part, _)| !self.enabled(part)) {
+            self.pressed = None;
+        }
+        let scale = self.scale();
+        let pixels = |dip: Rect| {
+            let [left, top, right, bottom] = dip.map(|v| (v * scale).ceil() as i32);
+            RECT {
+                left,
+                top,
+                right,
+                bottom,
+            }
+        };
+        let mut controls = Vec::new();
+        for (row, rect) in self.slots() {
+            let Row::Item { server, project } = row else {
+                continue;
+            };
+            let (name, port, _) = self.row_source(server, project);
+            let id = self.row_key(server, project);
+            let (body, editor) = row_buttons(rect);
+            let body_part = Part::Row(row, Zone::Body);
+            let editor_part = Part::Row(row, Zone::Editor);
+            let verb = if server.is_some() { "Open" } else { "Start" };
+            controls.push((
+                (id.clone(), Zone::Body),
+                body_part,
+                pixels(body),
+                format!("{verb} {name} on port {port}"),
+                self.enabled(body_part),
+            ));
+            controls.push((
+                (id, Zone::Editor),
+                editor_part,
+                pixels(editor),
+                format!("Open {name} in VS Code"),
+                self.enabled(editor_part),
+            ));
+        }
+        self.controls.sync(self.menu, controls);
+        self.focus_first_available();
+    }
+
+    fn focus_first_available(&mut self) {
+        if self.focus == MenuFocus::Hover || unsafe { GetForegroundWindow() } != self.menu {
+            return;
+        }
+        let focused = self.controls.focused();
+        if self.focus == MenuFocus::FindingFirst {
+            // Give Start an immediately usable action. An earlier starting row's ribbon may
+            // become the first action as its folder is checked, until the user navigates.
+            let mut pending = false;
+            let first = self.menu_rows.iter().find_map(|&row| {
+                if !matches!(row, Row::Item { .. }) {
+                    return None;
+                }
+                let action = [Zone::Body, Zone::Editor]
+                    .map(|zone| Part::Row(row, zone))
+                    .into_iter()
+                    .find(|&part| self.enabled(part));
+                if action.is_none()
+                    && (self.editor.exe.is_some()
+                        || self.editor_scans.contains_key(&EditorSource::Installation))
+                {
+                    pending |= self
+                        .row_dir(row)
+                        .is_some_and(|dir| !self.editor.folders.contains_key(dir));
+                }
+                action
+            });
+            if !pending {
+                self.focus = MenuFocus::Keyboard;
+            }
+            if focused.is_some() && focused == first {
+                return;
+            }
+        } else if focused.is_some() {
+            return;
+        }
+        if matches!(self.pressed, Some((_, Input::Key(_)))) {
+            self.pressed = None;
+        }
+        unsafe { SetFocus(self.menu) };
+        self.controls.step(false);
+        self.invalidate(self.menu);
+    }
+
+    fn key(&mut self, key: u16, down: bool, repeat: bool) {
+        if self.focus == MenuFocus::Hover || unsafe { GetForegroundWindow() } != self.menu {
+            return;
+        }
+        if down {
+            self.focus = MenuFocus::Keyboard;
+        }
+        match key {
+            VK_ESCAPE if down => self.hide_menu(),
+            VK_TAB if down => {
+                self.pressed = None;
+                self.controls
+                    .step(unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0);
+            }
+            VK_RETURN | VK_SPACE if down && !repeat => {
+                self.pressed = self.controls.focused().map(|part| (part, Input::Key(key)));
+            }
+            VK_RETURN | VK_SPACE if !down => return self.release(Input::Key(key)),
+            _ => {}
+        }
+        self.invalidate(self.menu);
     }
 
     /// Closes the normal menu. The toggle view closes through `close_toggle`.
     fn hide_menu(&mut self) {
-        if self.mode == Mode::Normal && self.menu_open() {
+        self.cancel_hover_timer();
+        if self.mode == Mode::Normal && !self.menu_rows.is_empty() {
+            self.focus = MenuFocus::Hover;
+            self.pressed = None;
             unsafe { ShowWindow(self.menu, SW_HIDE) };
+            self.controls.clear();
+            self.editor = EditorAvailability::default();
+            for scan in self.editor_scans.values_mut() {
+                scan.from_closed_menu = true;
+            }
             self.menu_rows.clear();
             if matches!(self.hover, Some(Part::Row(..))) {
                 self.set_hover(None);
@@ -816,12 +1343,12 @@ impl State {
         if self.mode == Mode::Toggle {
             return self.close_toggle();
         }
+        self.hide_menu();
         self.mode = Mode::Toggle;
         self.hook = unsafe {
             SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(null()), 0)
         };
         self.show_menu();
-        self.rehover();
     }
 
     fn close_toggle(&mut self) {
@@ -961,14 +1488,25 @@ impl State {
         })
     }
 
+    fn row_source(
+        &self,
+        server: Option<usize>,
+        project: Option<usize>,
+    ) -> (&str, u16, Option<&servers::Launch>) {
+        if let Some(i) = server {
+            let running = &self.servers[i];
+            (running.name.as_str(), running.port, running.launch.as_ref())
+        } else if let Some(p) = project {
+            let saved = &self.projects.list()[p];
+            (saved.launch.name(), saved.port, Some(&saved.launch))
+        } else {
+            ("", 0, None)
+        }
+    }
+
     /// An item's name, branch, port and text style.
     fn item(&self, server: Option<usize>, project: Option<usize>) -> (&str, String, String, Style) {
-        let saved = project.map(|p| &self.projects.list()[p]);
-        let (name, port, launch) = match (server.map(|i| &self.servers[i]), saved) {
-            (Some(running), _) => (running.name.as_str(), running.port, running.launch.as_ref()),
-            (None, Some(saved)) => (saved.launch.name(), saved.port, Some(&saved.launch)),
-            (None, None) => ("", 0, None),
-        };
+        let (name, port, launch) = self.row_source(server, project);
         let style = if self.is_default(project) {
             MENU_TEXT
         } else {
@@ -994,6 +1532,9 @@ impl State {
             + self.renderer.measure(&port, style);
         if self.mode == Mode::Toggle {
             width += 2.0 * (font::ACTION_SIZE + menu::ICON_TO_TEXT);
+        } else {
+            // The button supplies the right padding already counted by show_menu.
+            width += menu::EDITOR_W - menu::ROW_PAD_X;
         }
         width
     }
@@ -1009,9 +1550,9 @@ impl State {
 
     fn paint_strip(&self, dc: HDC, size: (i32, i32)) {
         let (r, l) = (&self.renderer, &self.layout);
-        r.paint(dc, size, self.dpi, color::TASKBAR, || {
+        r.paint(dc, size, self.dpi, Some(color::TASKBAR), || {
             if self.hover == Some(Part::Label) || self.menu_open() {
-                let pressed = self.pressed == Some(Part::Label);
+                let pressed = self.pressed.is_some_and(|(part, _)| part == Part::Label);
                 self.highlight(pressed, l.label, strip::HIT_RADIUS);
             }
             let server = self.servers.get(self.current);
@@ -1055,30 +1596,36 @@ impl State {
     fn present_menu(&self, rect: RECT) -> bool {
         let r = &self.renderer;
         let height = (rect.bottom - rect.top) as f32 / self.scale();
-        r.present(self.menu, rect, self.dpi, color::MENU_BORDER, || {
+        r.present(self.menu, rect, self.dpi, || {
+            let outside = [0.0, 0.0, self.menu_w, height];
+            r.fill(outside, strip::HIT_RADIUS, color::MENU_BORDER, 1.0);
             let inside = [
                 menu::BORDER,
                 menu::BORDER,
                 self.menu_w - menu::BORDER,
                 height - menu::BORDER,
             ];
-            r.fill(inside, 0.0, color::MENU, 1.0);
+            r.fill(inside, strip::HIT_RADIUS - menu::BORDER, color::MENU, 1.0);
+            let focus = self.controls.focused();
             for (row, rect) in self.slots() {
                 let (server, project) = match row {
                     Row::Item { server, project } => (server, project),
                     _ => (None, None),
                 };
                 let hovered = matches!(self.hover, Some(Part::Row(hovered, _)) if hovered == row);
+                let focused_zone = match focus {
+                    Some(Part::Row(focused_row, zone)) if focused_row == row => Some(zone),
+                    _ => None,
+                };
                 let lit = hovered
-                    || (self.mode == Mode::Normal
-                        && self.hover == Some(Part::Label)
-                        && server == Some(self.current))
+                    || focused_zone.is_some()
                     || (project.is_some() && project == self.drag);
                 if lit {
-                    let pressed = hovered && self.pressed == self.hover;
+                    let pressed = matches!(self.pressed, Some((Part::Row(r, zone), _))
+                        if r == row && zone != Zone::Editor);
                     self.highlight(pressed, rect, menu::ROW_RADIUS);
                 }
-                let content = [
+                let mut content = [
                     rect[0] + menu::ROW_PAD_X,
                     rect[1],
                     rect[2] - menu::ROW_PAD_X,
@@ -1094,10 +1641,53 @@ impl State {
                     Row::Close => {
                         r.text("Close defaults", MENU_TEXT, content, Align::Center, accent);
                     }
-                    Row::Item { .. } => self.paint_item(server, project, content, accent),
+                    Row::Item { .. } => {
+                        if self.mode == Mode::Normal {
+                            let (body, editor) = row_buttons(rect);
+                            content[2] = editor[0];
+                            self.paint_editor(row, editor, focused_zone == Some(Zone::Editor));
+                            if let Some(zone) = focused_zone {
+                                let button = if zone == Zone::Editor { editor } else { body };
+                                r.outline(
+                                    button,
+                                    menu::ROW_RADIUS,
+                                    menu::FOCUS_STROKE,
+                                    color::TEXT_DIM,
+                                );
+                            }
+                        }
+                        self.paint_item(server, project, content, accent);
+                    }
                 }
             }
         })
+    }
+
+    fn paint_editor(&self, row: Row, rect: Rect, focused: bool) {
+        let part = Part::Row(row, Zone::Editor);
+        let lit = (self.hover == Some(part) || focused) && self.enabled(part);
+        if lit {
+            let plate = [
+                rect[0] + menu::EDITOR_INSET_X,
+                rect[1] + menu::EDITOR_INSET_Y,
+                rect[2] - menu::EDITOR_INSET_X,
+                rect[3] - menu::EDITOR_INSET_Y,
+            ];
+            let pressed = self.pressed.is_some_and(|(down, _)| down == part);
+            let (color, alpha) = if pressed {
+                (color::EDITOR_PRESSED, color::EDITOR_PRESSED_ALPHA)
+            } else {
+                (color::HOVER, color::EDITOR_HOVER_ALPHA)
+            };
+            self.renderer.fill(plate, menu::EDITOR_RADIUS, color, alpha);
+        }
+        let ink = if lit { color::TEXT } else { color::TEXT_DIM };
+        self.renderer.vscode_ribbon(
+            rect[0] + menu::ROW_PAD_X,
+            (rect[1] + rect[3] - menu::EDITOR_ICON) / 2.0,
+            menu::EDITOR_ICON,
+            ink,
+        );
     }
 
     /// `accent` is the color of the toggle view's icons.
@@ -1163,6 +1753,12 @@ impl State {
             );
         }
     }
+}
+
+/// One split for painting, pointer hits and native button bounds.
+fn row_buttons([left, top, right, bottom]: Rect) -> (Rect, Rect) {
+    let split = right - menu::EDITOR_W;
+    ([left, top, split, bottom], [split, top, right, bottom])
 }
 
 unsafe fn paint(hwnd: HWND, draw: fn(&State, HDC, (i32, i32))) {
@@ -1256,19 +1852,15 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 track_leave(hwnd);
                 with(|state| state.strip_move(state.point(l)));
             }
-            WM_MOUSELEAVE => _ = with(|state| state.leave(false)),
-            WM_LBUTTONDOWN => _ = with(|state| state.press(true)),
-            WM_MBUTTONDOWN => _ = with(|state| state.press(false)),
-            WM_LBUTTONUP => _ = with(State::release),
-            WM_MBUTTONUP => _ = with(State::stop),
+            WM_MOUSELEAVE => _ = with(State::leave),
+            WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP | WM_MBUTTONUP => {
+                with(|state| state.mouse_button(hwnd, message, l));
+            }
             WM_MOUSEWHEEL => _ = with(|state| state.scroll((w >> 16) as i16 as i32)),
             // The host's menu runs inside DefWindowProcW, and the pointer may
             // be elsewhere by the time it closes.
             WM_CONTEXTMENU => {
-                with(|state| {
-                    KillTimer(state.menu, SHOW);
-                    state.hide_menu();
-                });
+                with(State::hide_menu);
                 let result = DefWindowProcW(hwnd, message, w, l);
                 with(State::rehover);
                 return result;
@@ -1276,11 +1868,12 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             WM_NCDESTROY => {
                 with(|state| {
                     if state.view == hwnd {
+                        state.menu_request = None;
                         state.close_toggle();
                         state.view = null_mut();
                         state.hover = None;
                         state.pressed = None;
-                        KillTimer(state.menu, SHOW);
+                        state.cancel_hover_timer();
                     }
                 });
                 return DefWindowProcW(hwnd, message, w, l);
@@ -1303,17 +1896,72 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 track_leave(hwnd);
                 with(|state| state.menu_move(state.point(l)));
             }
-            WM_MOUSELEAVE => _ = with(|state| state.leave(true)),
-            WM_LBUTTONDOWN => _ = with(|state| state.press(true)),
-            WM_MBUTTONDOWN => _ = with(|state| state.press(false)),
-            WM_LBUTTONUP => _ = with(State::release),
-            WM_MBUTTONUP => _ = with(State::stop),
+            WM_MOUSELEAVE => _ = with(State::leave),
+            WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP | WM_MBUTTONUP => {
+                with(|state| state.mouse_button(hwnd, message, l));
+            }
+            WM_KEYDOWN | WM_KEYUP => {
+                with(|state| state.key(w as u16, message == WM_KEYDOWN, l & (1 << 30) != 0));
+            }
+            WM_DRAWITEM => return 1, // Buttons are painted with the rest of the layered menu.
+            WM_COMMAND => {
+                with(|state| {
+                    let Some(part) = state.controls.action(l as HWND) else {
+                        return;
+                    };
+                    match (w >> 16) as u32 {
+                        BN_CLICKED => state.activate(part),
+                        BN_SETFOCUS => {
+                            if GetForegroundWindow() == hwnd {
+                                state.focus = MenuFocus::Keyboard;
+                                state.cancel_hover_timer();
+                            }
+                            state.invalidate(hwnd);
+                        }
+                        BN_KILLFOCUS => {
+                            if matches!(state.pressed, Some((held, Input::Key(_))) if held == part)
+                            {
+                                state.pressed = None;
+                            }
+                            state.invalidate(hwnd);
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            WM_ACTIVATE if (w as u16) == WA_INACTIVE as u16 => {
+                with(|state| {
+                    if state.focus != MenuFocus::Hover {
+                        state.hide_menu();
+                    }
+                });
+                return DefWindowProcW(hwnd, message, w, l);
+            }
+            instance::SHOW_MENU => {
+                with(|state| {
+                    let request = instance::MenuRequest::from_message(w, l);
+                    if request.is_fresh() {
+                        state.menu_request = Some(request);
+                        state.try_menu_request();
+                    }
+                });
+            }
+            VIEW_READY => _ = with(State::try_menu_request),
+            EDITOR_READY => _ = with(State::editor_ready),
             WM_CAPTURECHANGED => _ = with(State::end_drag),
             BUTTON_DOWN => _ = with(|state| state.button_down(w as u32, l as HWND)),
             FOREGROUND_CHANGED => {
-                if let Some(view) = with(|state| state.view) {
-                    raise_for_taskbar(hwnd, view, GetForegroundWindow());
-                }
+                let foreground = GetForegroundWindow();
+                with(|state| {
+                    if state.focus != MenuFocus::Hover
+                        && !foreground.is_null()
+                        && foreground != hwnd
+                    {
+                        state.hide_menu();
+                    } else {
+                        raise_for_taskbar(hwnd, state.view, foreground);
+                    }
+                });
             }
             // Right-click anywhere opens the host's menu, which the strip forwards.
             WM_CONTEXTMENU => {
@@ -1322,14 +1970,7 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
             }
             WM_TIMER if w == POLL => _ = with(State::refresh),
-            WM_TIMER if w == SHOW => {
-                KillTimer(hwnd, SHOW);
-                with(|state| {
-                    if state.hover == Some(Part::Label) {
-                        state.show_menu();
-                    }
-                });
-            }
+            WM_TIMER if w == HOVER => _ = with(State::finish_hover),
             WM_TIMER if w == SPIN => _ = with(|state| state.spin()),
             WM_CLOSE => {
                 EndMenu();

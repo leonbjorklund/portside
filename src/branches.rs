@@ -1,9 +1,11 @@
-//! Current checkout labels for project folders, read off the UI thread.
+//! Current checkout labels and worktree roots, read off the UI thread.
 
 use std::{
     env,
+    ffi::OsStr,
     io::Read,
     os::windows::{io::AsRawHandle, process::CommandExt},
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     ptr::null_mut,
     sync::{
@@ -23,35 +25,34 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
 const MAX_OUTPUT: usize = 64 * 1024;
 
-type Entries = Vec<(String, String)>;
+type Entries = Vec<(String, Option<String>)>;
+type Request = (Arc<AtomicBool>, Vec<String>);
 
 pub struct Branches {
     entries: Entries,
-    requests: Option<Sender<Vec<String>>>,
-    results: Receiver<Entries>,
+    requests: Option<Sender<Request>>,
+    results: Receiver<(Arc<AtomicBool>, Entries)>,
     pending: bool,
+    priority: Option<String>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Branches {
     pub fn new() -> Self {
-        let (requests, folders) = mpsc::channel::<Vec<String>>();
+        let (requests, folders) = mpsc::channel::<Request>();
         let (results, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::clone(&stop);
         let worker = thread::spawn(move || {
-            while let Ok(dirs) = folders.recv() {
+            while let Ok((cancelled, dirs)) = folders.recv() {
                 let mut entries = Vec::new();
                 for dir in dirs {
                     if cancelled.load(Ordering::Relaxed) {
-                        return;
+                        break;
                     }
-                    if let Some(branch) = read(&dir, &cancelled) {
-                        entries.push((dir, branch));
-                    }
+                    let branch = read(&dir, &cancelled);
+                    entries.push((dir, branch));
                 }
-                if results.send(entries).is_err() {
+                if results.send((cancelled, entries)).is_err() {
                     break;
                 }
             }
@@ -61,9 +62,33 @@ impl Branches {
             requests: Some(requests),
             results: receiver,
             pending: false,
-            stop,
+            priority: None,
+            stop: Arc::new(AtomicBool::new(false)),
             worker: Some(worker),
         }
+    }
+
+    /// Start needs this one result even when a batch of old folders is still running.
+    pub fn prioritize(&mut self, dir: &str) {
+        if self.checked(dir)
+            || self
+                .priority
+                .as_deref()
+                .is_some_and(|pending| pending.eq_ignore_ascii_case(dir))
+        {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.stop = Arc::new(AtomicBool::new(false));
+        self.request(vec![dir.to_owned()]);
+        self.priority = self.pending.then(|| dir.to_owned());
+    }
+
+    fn request(&mut self, dirs: Vec<String>) {
+        self.pending = self
+            .requests
+            .as_ref()
+            .is_some_and(|requests| requests.send((Arc::clone(&self.stop), dirs)).is_ok());
     }
 
     /// Takes completed reads and requests another batch without waiting.
@@ -74,26 +99,41 @@ impl Branches {
         let before = self.entries.len();
         self.entries.retain(|(dir, _)| tracked(dir));
         let mut changed = before != self.entries.len();
-        if let Ok(mut entries) = self.results.try_recv() {
+        while let Ok((cancelled, mut entries)) = self.results.try_recv() {
+            // An old batch may have sent its results just before Start interrupted it.
+            if cancelled.load(Ordering::Relaxed) {
+                continue;
+            }
             self.pending = false;
             entries.retain(|(dir, _)| tracked(dir));
-            changed |= entries != self.entries;
-            self.entries = entries;
+            if self.priority.take().is_some() {
+                changed |= !entries.is_empty();
+                self.entries.extend(entries);
+            } else {
+                changed |= entries != self.entries;
+                self.entries = entries;
+            }
         }
         if !self.pending && !dirs.is_empty() {
-            self.pending = self
-                .requests
-                .as_ref()
-                .is_some_and(|requests| requests.send(dirs).is_ok());
+            self.request(dirs);
         }
         changed
     }
 
-    pub fn get(&self, dir: &str) -> Option<&str> {
+    fn entry(&self, dir: &str) -> Option<&Option<String>> {
         self.entries
             .iter()
             .find(|(folder, _)| folder.eq_ignore_ascii_case(dir))
-            .map(|(_, branch)| branch.as_str())
+            .map(|(_, branch)| branch)
+    }
+
+    pub fn get(&self, dir: &str) -> Option<&str> {
+        self.entry(dir)?.as_deref()
+    }
+
+    /// A first lookup has finished, even if the folder has no branch.
+    pub fn checked(&self, dir: &str) -> bool {
+        self.entry(dir).is_some()
     }
 }
 
@@ -140,9 +180,26 @@ fn read(dir: &str, stop: &AtomicBool) -> Option<String> {
     })
 }
 
-fn git(dir: &str) -> Command {
+/// The root of this checkout, including when it is a linked Git worktree.
+pub fn worktree_root(dir: &Path) -> Option<PathBuf> {
+    let (status, bytes) = output(
+        git(dir).args(["rev-parse", "--show-toplevel"]),
+        &AtomicBool::new(false),
+        Instant::now() + TIMEOUT,
+    )?;
+    if !status.success() {
+        return None;
+    }
+    let path = std::str::from_utf8(&bytes)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    let root = PathBuf::from(path);
+    root.is_absolute().then_some(root)
+}
+
+fn git(dir: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new("git");
-    command.args(["-C", dir]);
+    command.arg("-C").arg(dir);
     // An agent or terminal may have selected a different repository through
     // its environment. The project's folder is the sole source here.
     for (key, _) in env::vars_os() {
@@ -223,7 +280,7 @@ fn output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{fs, time::SystemTime};
 
     struct Repo(PathBuf);
 
@@ -246,7 +303,7 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) {
-            let output = git(&self.dir())
+            let output = git(&self.0)
                 .env("GIT_CONFIG_GLOBAL", "NUL")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args([
@@ -274,17 +331,21 @@ mod tests {
     }
 
     #[test]
-    fn reads_named_branches_in_nested_folders_and_linked_worktrees() {
+    fn reads_branches_and_roots_in_nested_folders_and_linked_worktrees() {
         let repo = Repo::new();
         let stop = AtomicBool::new(false);
-        let nested = repo.0.join("nested");
+        let nested = repo.0.join("preview & menü");
         fs::create_dir(&nested).unwrap();
         assert_eq!(
             read(nested.to_str().unwrap(), &stop).as_deref(),
             Some("main")
         );
+        assert_eq!(
+            worktree_root(&nested).unwrap().canonicalize().unwrap(),
+            repo.0.canonicalize().unwrap()
+        );
         repo.git(&["commit", "--allow-empty", "-m", "initial"]);
-        let worktree = repo.0.join("worktree");
+        let worktree = repo.0.join("worktree & menü");
         repo.git(&[
             "worktree",
             "add",
@@ -292,6 +353,12 @@ mod tests {
             "feature/menü",
             worktree.to_str().unwrap(),
         ]);
+        let nested = worktree.join("preview");
+        fs::create_dir(&nested).unwrap();
+        assert_eq!(
+            worktree_root(&nested).unwrap().canonicalize().unwrap(),
+            worktree.canonicalize().unwrap()
+        );
         assert_eq!(
             read(worktree.to_str().unwrap(), &stop).as_deref(),
             Some("feature/menü")
@@ -341,6 +408,7 @@ mod tests {
                 thread::sleep(POLL);
             }
         };
+        assert!(!branches.checked(&repo.dir()));
         wait(&mut branches, Some("main"));
         repo.git(&["symbolic-ref", "HEAD", "refs/heads/feature/menu"]);
         wait(&mut branches, Some("feature/menu"));
@@ -348,16 +416,19 @@ mod tests {
         let backup = repo.0.join(".git/HEAD.before");
         fs::rename(&head, &backup).unwrap();
         wait(&mut branches, None);
+        assert!(branches.checked(&repo.dir()));
         fs::rename(&backup, &head).unwrap();
         wait(&mut branches, Some("feature/menu"));
         assert!(branches.refresh(Vec::new()));
         assert_eq!(branches.get(&repo.dir()), None);
+        assert!(!branches.checked(&repo.dir()));
         // A result already in flight must not restore a removed folder.
         while branches.pending {
             branches.refresh(Vec::new());
             thread::sleep(POLL);
         }
         assert_eq!(branches.get(&repo.dir()), None);
+        assert!(!branches.checked(&repo.dir()));
     }
 
     #[test]

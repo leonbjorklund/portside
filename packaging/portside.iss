@@ -39,7 +39,7 @@ Source: "licenses\*.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion touch
 Source: "..\target\package-tools\Rust-COPYRIGHT-library.html"; DestDir: "{app}\licenses"; Flags: ignoreversion touch
 
 [Icons]
-Name: "{userprograms}\Portside"; Filename: "{app}\portside.exe"; WorkingDir: "{app}"
+Name: "{userprograms}\Portside"; Filename: "{app}\portside.exe"; Parameters: "--show-menu"; WorkingDir: "{app}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Portside"; ValueData: """{app}\portside.exe"""; Flags: uninsdeletevalue

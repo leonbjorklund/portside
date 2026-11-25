@@ -1,0 +1,140 @@
+.portside-strip {
+  --lead: 6px;
+  --label-pad: 6px;
+  --globe-size: 12px;
+  --globe-gap: 7px;
+  --count-gap: 10px;
+  --name-slot: 158px;
+
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: max-content;
+  height: 26px;
+  overflow: hidden;
+  background: #1c1c1c;
+  color: #f1f3f4;
+  font: 400 13px/22px "Portside Atkinson", sans-serif;
+  letter-spacing: normal;
+  text-align: left;
+  user-select: none;
+}
+
+/* The Win32 host reserves the width of 99/99 even when the count is hidden. */
+.portside-strip::before {
+  display: block;
+  box-sizing: content-box;
+  width: max-content;
+  padding-left: calc(var(--lead) + var(--label-pad) + var(--globe-size) + var(--globe-gap));
+  padding-right: calc(var(--count-gap) + var(--name-slot) + var(--label-pad));
+  font-variant-numeric: tabular-nums;
+  visibility: hidden;
+  content: "99/99";
+}
+
+.portside-strip[data-empty] {
+  width: calc(var(--lead) + 2 * var(--label-pad) + var(--globe-size));
+}
+
+.portside-strip[data-empty]::before {
+  content: none;
+}
+
+.portside-strip .portside-strip-label {
+  position: absolute;
+  top: 2px;
+  left: var(--lead);
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  width: max-content;
+  height: 22px;
+  margin: 0;
+  padding: 0 var(--label-pad);
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  white-space: pre;
+  cursor: default;
+  appearance: none;
+  /* A transparent compositing layer matches Direct2D's grayscale text on Windows. */
+  filter: opacity(1);
+}
+
+.portside-strip-label[data-state="hovered"] {
+  background: rgb(255 255 255 / 8%);
+}
+
+.portside-strip-label[data-state="pressed"] {
+  background: rgb(255 255 255 / 5%);
+}
+
+.portside-strip-label:focus-visible {
+  outline: 1px solid currentColor;
+  outline-offset: -1px;
+}
+
+.portside-strip-label:disabled {
+  opacity: 1;
+  pointer-events: none;
+}
+
+.portside-strip-globe {
+  flex: none;
+  width: var(--globe-size);
+  font: 400 var(--globe-size)/1 "Portside Fluent", "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
+}
+
+.portside-strip[data-empty] .portside-strip-globe {
+  color: #6b6b6b;
+}
+
+.portside-strip-count {
+  position: relative;
+  flex: none;
+  margin-left: var(--globe-gap);
+  color: #9c9c9c;
+  font-variant-numeric: tabular-nums;
+}
+
+/* total/total sizes the column; the current position aligns to its right. */
+.portside-strip-count::before {
+  visibility: hidden;
+  content: attr(data-capacity);
+}
+
+.portside-strip-count > span {
+  position: absolute;
+  inset: 0;
+  text-align: right;
+}
+
+.portside-strip-server {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: var(--name-slot);
+  margin-left: var(--globe-gap);
+}
+
+.portside-strip-count:not([hidden]) + .portside-strip-server {
+  margin-left: var(--count-gap);
+}
+
+.portside-strip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.portside-strip-port {
+  flex: none;
+  color: #9c9c9c;
+}
+
+.portside-strip [hidden] {
+  display: none;
+}

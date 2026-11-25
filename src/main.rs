@@ -1,9 +1,11 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod branches;
+mod editor;
 mod fetch;
 mod instance;
 mod json;
+mod menu_controls;
 mod projects;
 mod render;
 mod servers;
@@ -20,19 +22,27 @@ fn wide(text: &str) -> Vec<u16> {
 
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    match args.as_slice() {
+    let menu_request = match args.as_slice() {
         [arg] if arg == "--quit" => return instance::close_existing(),
         [arg] if arg == "--start" => return instance::start(),
-        [] => {}
-        _ => return Err("Run without arguments.".into()),
-    }
-    match instance::Instance::acquire()? {
-        Some(_instance) => {
-            update::start();
-            ui::run()
+        [arg] if arg == "--show-menu" => {
+            let request = instance::MenuRequest::capture();
+            if instance::setup_running() {
+                return Ok(());
+            }
+            request
         }
-        None => Ok(()),
-    }
+        [] => None,
+        _ => return Err("Run without arguments.".into()),
+    };
+    let Some(_instance) = instance::acquire()? else {
+        if let Some(request) = menu_request {
+            request.forward();
+        }
+        return Ok(());
+    };
+    update::start();
+    ui::run(menu_request)
 }
 
 fn main() {

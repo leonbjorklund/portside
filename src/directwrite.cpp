@@ -24,9 +24,59 @@ struct Style {
     UINT32 feature;
 };
 
+// The two closed contours from design/preview/index.html#vscode-button,
+// expressed in the SVG's original 256-unit coordinates.
+HRESULT create_vscode_ribbon(ID2D1Factory* factory, ID2D1PathGeometry** result) noexcept {
+    ComPtr<ID2D1PathGeometry> path;
+    HRESULT hr = factory->CreatePathGeometry(path.GetAddressOf());
+    if (FAILED(hr)) return hr;
+    ComPtr<ID2D1GeometrySink> sink;
+    hr = path->Open(sink.GetAddressOf());
+    if (FAILED(hr)) return hr;
+    sink->SetFillMode(D2D1_FILL_MODE_ALTERNATE);
+    const auto arc_to = [&](D2D1_POINT_2F end, float radius) {
+        sink->AddArc(D2D1::ArcSegment(end, D2D1::SizeF(radius, radius), 0.0f,
+            D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+    };
+    sink->BeginFigure({181.534f, 254.252f}, D2D1_FIGURE_BEGIN_FILLED);
+    arc_to({194.234f, 253.764f}, 15.934f);
+    sink->AddLine({246.940f, 228.403f});
+    arc_to({256.000f, 213.983f}, 16.002f);
+    sink->AddLine({256.000f, 42.018f});
+    sink->AddBezier(D2D1::BezierSegment(
+        {256.000f, 35.868f}, {252.478f, 30.264f}, {246.940f, 27.598f}));
+    sink->AddLine({194.234f, 2.238f});
+    arc_to({176.049f, 5.335f}, 15.939f);
+    sink->AddLine({75.149f, 97.387f});
+    sink->AddLine({31.199f, 64.026f});
+    arc_to({17.585f, 64.631f}, 10.655f);
+    sink->AddLine({3.490f, 77.453f});
+    sink->AddBezier(D2D1::BezierSegment(
+        {-1.158f, 81.680f}, {-1.163f, 88.993f}, {3.479f, 93.227f}));
+    sink->AddLine({41.593f, 128.000f});
+    sink->AddLine({3.478f, 162.773f});
+    sink->AddBezier(D2D1::BezierSegment(
+        {-1.164f, 167.008f}, {-1.159f, 174.320f}, {3.489f, 178.548f}));
+    sink->AddLine({17.586f, 191.370f});
+    arc_to({31.199f, 191.976f}, 10.655f);
+    sink->AddLine({75.149f, 158.614f});
+    sink->AddLine({176.049f, 250.667f});
+    arc_to({181.534f, 254.252f}, 15.915f);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+    sink->BeginFigure({192.039f, 69.885f}, D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddLine({115.479f, 128.000f});
+    sink->AddLine({192.039f, 186.115f});
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    hr = sink->Close();
+    if (SUCCEEDED(hr)) *result = path.Detach();
+    return hr;
+}
+
 struct Renderer final {
     ComPtr<ID2D1Factory> d2d;
     ComPtr<ID2D1StrokeStyle> round_caps;
+    ComPtr<ID2D1PathGeometry> vscode_ribbon;
     ComPtr<IDWriteFactory5> dwrite;
     ComPtr<IDWriteInMemoryFontFileLoader> loader;
     ComPtr<IDWriteFontCollection1> collection;
@@ -119,10 +169,10 @@ struct Renderer final {
         return S_OK;
     }
 
-    HRESULT begin(HDC dc, int width, int height, float dpi, UINT32 background) noexcept {
+    HRESULT begin(HDC dc, int width, int height, float dpi, const UINT32* background) noexcept {
         if (!target) {
             const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
             HRESULT hr = d2d->CreateDCRenderTarget(&properties, target.GetAddressOf());
             if (SUCCEEDED(hr)) hr = target->CreateSolidColorBrush(D2D1::ColorF(0), brush.GetAddressOf());
             if (FAILED(hr)) {
@@ -140,7 +190,8 @@ struct Renderer final {
             return hr;
         }
         target->BeginDraw();
-        target->Clear(D2D1::ColorF(background));
+        if (background) target->Clear(D2D1::ColorF(*background));
+        else target->Clear(nullptr);
         return S_OK;
     }
 
@@ -183,7 +234,7 @@ extern "C" float portside_measure(void* handle, const wchar_t* text, unsigned in
 }
 
 extern "C" HRESULT portside_begin(void* handle, HDC dc, int width, int height, float dpi,
-    unsigned int background) noexcept {
+    const unsigned int* background) noexcept {
     return static_cast<Renderer*>(handle)->begin(dc, width, height, dpi, background);
 }
 
@@ -192,6 +243,29 @@ extern "C" void portside_fill(void* handle, const D2D1_RECT_F* rect, float radiu
     auto* renderer = static_cast<Renderer*>(handle);
     renderer->target->FillRoundedRectangle(D2D1::RoundedRect(*rect, radius, radius),
         renderer->paint(color, alpha));
+}
+
+extern "C" void portside_outline(void* handle, const D2D1_RECT_F* rect, float radius,
+    float stroke, unsigned int color) noexcept {
+    auto* renderer = static_cast<Renderer*>(handle);
+    const float half = stroke / 2.0f;
+    const auto centerline = D2D1::RectF(rect->left + half, rect->top + half,
+        rect->right - half, rect->bottom - half);
+    renderer->target->DrawRoundedRectangle(D2D1::RoundedRect(centerline, radius - half, radius - half),
+        renderer->paint(color, 1.0f), stroke);
+}
+
+extern "C" void portside_vscode_ribbon(void* handle, float x, float y, float size,
+    unsigned int color) noexcept {
+    auto* renderer = static_cast<Renderer*>(handle);
+    if (!renderer->vscode_ribbon && FAILED(create_vscode_ribbon(renderer->d2d.Get(),
+        renderer->vscode_ribbon.GetAddressOf()))) return;
+    const float scale = size / 256.0f;
+    D2D1::Matrix3x2F previous;
+    renderer->target->GetTransform(&previous);
+    renderer->target->SetTransform(D2D1::Matrix3x2F(scale, 0, 0, scale, x, y) * previous);
+    renderer->target->FillGeometry(renderer->vscode_ribbon.Get(), renderer->paint(color, 1.0f));
+    renderer->target->SetTransform(previous);
 }
 
 // align: 0 leading, 1 trailing, 2 center (DWRITE_TEXT_ALIGNMENT).

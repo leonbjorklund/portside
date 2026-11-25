@@ -1,0 +1,253 @@
+/* Portside's lengths are DIPs. The canvas scales the whole strip and panel together. */
+.ps-menu {
+  --ps-menu-font-size: 13px;
+  --ps-row-height: 26px;
+  --ps-row-pad-x: 8px;
+  --ps-menu-text: #f1f3f4;
+  --ps-menu-dim: #9c9c9c;
+  --ps-menu-stopped: #949494;
+  --ps-menu-accent: var(--ps-menu-dim);
+  --ps-menu-border: #3a3a3a;
+  --ps-menu-rounding: var(--ps-menu-pixel, var(--ps-menu-device-pixel, 1px));
+  display: inline-flex;
+  flex-direction: column;
+  align-items: stretch;
+  flex: none;
+  gap: 1px;
+  box-sizing: content-box;
+  width: max-content;
+  width: calc-size(max-content, round(up, size, var(--ps-menu-rounding)));
+  height: max-content;
+  height: calc-size(max-content, round(up, size, var(--ps-menu-rounding)));
+  padding: 6px; /* 1 DIP border and 5 DIPs of inner padding */
+  border: 0;
+  border-radius: 4px;
+  background: #2b2b2b;
+  box-shadow: inset 0 0 0 1px var(--ps-menu-border);
+  color: var(--ps-menu-text);
+  font: 400 var(--ps-menu-font-size)/normal "Portside Atkinson", sans-serif;
+  font-synthesis: none;
+  letter-spacing: normal;
+  text-align: left;
+  white-space: pre;
+  user-select: none;
+}
+
+.ps-menu button,
+.ps-context-menu button {
+  appearance: none;
+  box-sizing: border-box;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: none;
+  cursor: default;
+}
+
+.ps-menu .ps-menu-row,
+.ps-menu .ps-menu-close {
+  display: flex;
+  flex: none;
+  align-items: center;
+  box-sizing: border-box;
+  height: var(--ps-row-height);
+  padding: 0;
+  border-radius: 4px;
+  color: var(--ps-menu-stopped);
+  /* A transparent compositing layer gives text DirectWrite's grayscale antialiasing. */
+  filter: opacity(1);
+  white-space: pre;
+}
+
+.ps-menu-row[data-default="false"] { font-style: italic; }
+.ps-menu .ps-menu-row[data-status="running"] { color: var(--ps-menu-text); }
+.ps-menu-label { margin-inline-end: auto; }
+.ps-menu-branch { font-style: italic; }
+.ps-menu-port { position: relative; margin-inline-start: calc(44px / 1.5); }
+
+.ps-menu .ps-menu-close {
+  justify-content: center;
+  padding-inline: var(--ps-row-pad-x);
+  color: var(--ps-menu-accent);
+}
+
+.ps-menu .ps-menu-separator {
+  height: 1px;
+  flex: none;
+  margin: 2px var(--ps-row-pad-x);
+  background: var(--ps-menu-border);
+}
+
+.ps-menu .ps-menu-row:hover,
+.ps-menu .ps-menu-close:hover,
+.ps-menu .ps-menu-row:has(:focus-visible),
+.ps-menu .ps-menu-close:focus-visible,
+.ps-menu .ps-menu-dragging {
+  --ps-menu-accent: var(--ps-menu-text);
+  background: rgb(255 255 255 / 8%);
+}
+
+.ps-menu .ps-menu-row:has(.ps-menu-body:active),
+.ps-menu .ps-menu-row:has(.ps-menu-control:not([data-action="reorder"]):active),
+.ps-menu .ps-menu-close:active {
+  background: rgb(255 255 255 / 5%);
+}
+
+.ps-menu button:focus-visible {
+  outline: 1px solid var(--ps-menu-dim);
+  outline-offset: -1px;
+}
+
+/* The server action and the editor action each own their part of the row. */
+.ps-menu .ps-menu-body {
+  display: flex;
+  flex: 1 0 auto;
+  align-self: stretch;
+  align-items: center;
+  padding-block: 0;
+  padding-inline: var(--ps-row-pad-x) 0;
+  border-radius: 4px;
+  white-space: pre;
+}
+
+.ps-menu .ps-menu-editor {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  flex: none;
+  align-self: stretch;
+  place-items: center;
+  padding: 0 var(--ps-row-pad-x);
+  border-radius: 4px;
+  color: var(--ps-menu-dim);
+  cursor: pointer;
+}
+.ps-menu-editor svg { display: block; pointer-events: none; }
+.ps-menu .ps-menu-editor:is(:hover, :focus-visible) { color: var(--ps-menu-text); }
+.ps-menu-editor::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 2px 3px;
+  border-radius: 3px;
+  pointer-events: none;
+}
+.ps-menu-editor:is(:hover, :focus-visible)::before { background: rgb(255 255 255 / 10%); }
+.ps-menu-editor:active::before { background: rgb(0 0 0 / 12%); }
+
+.ps-menu .ps-menu-leading,
+.ps-menu .ps-menu-trailing {
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  flex: none;
+  width: calc(13px + var(--ps-row-pad-x)); /* action glyph + row padding */
+  height: var(--ps-row-height);
+  color: var(--ps-menu-accent);
+}
+
+.ps-menu .ps-menu-leading { margin-right: 5px; padding: 0 0 0 var(--ps-row-pad-x); }
+.ps-menu .ps-menu-trailing { margin-left: 5px; padding: 0 var(--ps-row-pad-x) 0 0; }
+
+.ps-menu-glyph {
+  font: 400 13px/1 "Portside Fluent", "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
+}
+
+.ps-menu-control[data-action="reorder"] { touch-action: none; }
+.ps-menu-handle { position: relative; width: 9px; height: 7px; }
+.ps-menu-handle::before,
+.ps-menu-handle::after {
+  position: absolute;
+  left: 0;
+  top: 1.5px;
+  width: 9px;
+  height: 1px;
+  border-radius: .5px;
+  background: currentColor;
+  content: "";
+}
+.ps-menu-handle::after { top: 4.5px; }
+
+.ps-menu-spinner {
+  position: absolute;
+  inset-inline-end: calc(100% + 5px);
+  top: calc(50% - 5.5px);
+  width: 11px;
+  height: 11px;
+  color: var(--ps-menu-dim);
+  animation: ps-menu-turn 1s steps(30, end) infinite;
+}
+/* A 270° arc with a 4.1 DIP radius and a 1.15 DIP stroke with round ends. */
+.ps-menu-spinner::before,
+.ps-menu-spinner::after {
+  position: absolute;
+  content: "";
+}
+.ps-menu-spinner::before {
+  inset: 0;
+  background: conic-gradient(currentColor 0 270deg, transparent 270deg);
+  mask: radial-gradient(circle, transparent 3.525px, #000 3.525px 4.675px, transparent 4.675px);
+}
+.ps-menu-spinner::after {
+  left: calc(50% - .575px);
+  top: calc(50% - 4.675px);
+  width: 1.15px;
+  height: 1.15px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: -4.1px 4.1px currentColor;
+}
+@keyframes ps-menu-turn { to { transform: rotate(1turn); } }
+@media (prefers-reduced-motion: reduce) {
+  .ps-menu-spinner { animation: none; }
+}
+
+/* The taskbar host asks Windows to draw this separate context menu. */
+.ps-context-menu {
+  display: inline-flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: 96px;
+  padding: 2px;
+  border: 1px solid #e5e5e5;
+  background: #f9f9f9;
+  box-shadow: 2px 3px 6px #0005;
+  color: #000;
+  color-scheme: light;
+  font: 400 12px/normal "Segoe UI", sans-serif;
+  letter-spacing: normal;
+  white-space: nowrap;
+  user-select: none;
+}
+.ps-context-menu:focus { outline: none; }
+
+.ps-context-menu .ps-context-item {
+  position: relative;
+  height: 20px;
+  padding: 0 20px 0 28px;
+  border-radius: 0;
+  text-align: left;
+}
+
+.ps-context-item[aria-checked="true"]::before {
+  position: absolute;
+  left: 4px;
+  width: 16px;
+  content: "✓";
+  text-align: center;
+}
+.ps-context-menu .ps-context-item:hover,
+.ps-context-menu .ps-context-item:focus-visible {
+  outline: none;
+  background: #95cdfb;
+}
+.ps-context-menu .ps-menu-separator {
+  height: 1px;
+  margin: 2px 0 2px 24px;
+  background: #d7d7d7;
+}

@@ -45,6 +45,9 @@ pub mod color {
     /// White drawn over the background at this opacity.
     pub const HOVER_ALPHA: f32 = 0.08;
     pub const PRESSED_ALPHA: f32 = 0.05;
+    pub const EDITOR_HOVER_ALPHA: f32 = 0.10;
+    pub const EDITOR_PRESSED: Rgb = 0x000000;
+    pub const EDITOR_PRESSED_ALPHA: f32 = 0.12;
 
     pub const MENU: Rgb = 0x2b2b2b;
     /// The menu's border and the line between its groups.
@@ -83,16 +86,21 @@ pub mod strip {
 /// into it directly.
 pub mod menu {
     pub const SHOW_DELAY_MS: u32 = 350;
-    pub const PAD: f32 = 3.0;
+    pub const HIDE_DELAY_MS: u32 = 500;
+    pub const PAD: f32 = 5.0;
     pub const BORDER: f32 = 1.0;
-    /// DWMWCP_ROUND, which also gives the system shadow.
-    #[expect(dead_code, reason = "DWM rounds the corners; this records its radius")]
-    pub const RADIUS: f32 = 8.0;
     /// The 16-DIP text line with 5 DIPs above and below.
     pub const ROW_H: f32 = 26.0;
     pub const ROW_PAD_X: f32 = 8.0;
     pub const ROW_GAP: f32 = 1.0;
     pub const ROW_RADIUS: f32 = 4.0;
+    /// The ribbon and its full-height button at the end of a server row.
+    pub const EDITOR_ICON: f32 = 12.0;
+    pub const EDITOR_W: f32 = EDITOR_ICON + 2.0 * ROW_PAD_X;
+    pub const EDITOR_INSET_X: f32 = 3.0;
+    pub const EDITOR_INSET_Y: f32 = 2.0;
+    pub const EDITOR_RADIUS: f32 = 3.0;
+    pub const FOCUS_STROKE: f32 = 1.0;
     /// 44 screen pixels at 150% Windows scale, including the spinner slot.
     pub const NAME_TO_PORT_MIN: f32 = 44.0 / 1.5;
 
