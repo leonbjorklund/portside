@@ -16,7 +16,7 @@ pub mod font {
 
     /// The count, name and port, at agent-usage-overlay's text size.
     pub const STRIP_SIZE: f32 = 13.0;
-    pub const MENU_SIZE: f32 = 12.0;
+    pub const MENU_SIZE: f32 = 13.0;
     /// The count uses the `tnum` feature: Atkinson's default digits are
     /// proportional, so "1/3" and "2/3" would otherwise differ in width.
     pub const COUNT_FEATURE: [u8; 4] = *b"tnum";
@@ -88,8 +88,9 @@ pub mod menu {
     /// DWMWCP_ROUND, which also gives the system shadow.
     #[expect(dead_code, reason = "DWM rounds the corners; this records its radius")]
     pub const RADIUS: f32 = 8.0;
-    pub const ROW_H: f32 = 22.0;
-    pub const ROW_PAD_X: f32 = 6.0;
+    /// The 16-DIP text line with 5 DIPs above and below.
+    pub const ROW_H: f32 = 26.0;
+    pub const ROW_PAD_X: f32 = 8.0;
     pub const ROW_GAP: f32 = 1.0;
     pub const ROW_RADIUS: f32 = 4.0;
     /// 44 screen pixels at 150% Windows scale, including the spinner slot.
